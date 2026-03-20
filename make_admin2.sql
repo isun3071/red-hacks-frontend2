@@ -1,0 +1,1 @@
+INSERT INTO public.profiles (id, username, role) VALUES ('6ea66274-d32b-4e05-ae43-ecfb6397295c', 'Denali Schlesinger', 'admin') ON CONFLICT (id) DO UPDATE SET role = 'admin', username = 'Denali Schlesinger';

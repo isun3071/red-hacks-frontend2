@@ -1,0 +1,3 @@
+INSERT INTO auth.users (instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at) VALUES ('00000000-0000-0000-0000-000000000000','6ea66274-d32b-4e05-ae43-ecfb6397295c', 'authenticated', 'authenticated', 'denalischlesinger06@gmail.com', '', now(), now(), '{"provider": "google", "providers": ["google"]}', '{"name": "Denali Schlesinger"}', now(), now()) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.profiles (id, username, role) VALUES ('6ea66274-d32b-4e05-ae43-ecfb6397295c', 'Denali Schlesinger', 'admin') ON CONFLICT (id) DO UPDATE SET role = 'admin', username = 'Denali Schlesinger';

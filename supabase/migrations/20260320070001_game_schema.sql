@@ -18,7 +18,7 @@ CREATE TABLE profiles (
 
 -- Games (Framework)
 CREATE TABLE games (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   start_time TIMESTAMPTZ NOT NULL,
   end_time TIMESTAMPTZ NOT NULL,
@@ -31,7 +31,7 @@ CREATE TABLE games (
 
 -- Teams
 CREATE TABLE teams (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   game_id UUID REFERENCES games(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   invite_code TEXT UNIQUE NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE teams (
 
 -- Team Members
 CREATE TABLE team_members (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   team_id UUID REFERENCES teams(id) ON DELETE CASCADE,
   user_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
   role team_role DEFAULT 'member'::team_role,
@@ -52,7 +52,7 @@ CREATE TABLE team_members (
 
 -- Reusable Tools
 CREATE TABLE tools (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL UNIQUE,
   description TEXT,
   spec JSONB NOT NULL, -- OpenRouter tool specification
@@ -62,7 +62,7 @@ CREATE TABLE tools (
 
 -- Reusable Interp Args
 CREATE TABLE interp_args (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL UNIQUE,
   configuration JSONB NOT NULL,
   created_by UUID REFERENCES profiles(id),
@@ -71,7 +71,7 @@ CREATE TABLE interp_args (
 
 -- Admin Challenges
 CREATE TABLE challenges (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   model_name TEXT NOT NULL,
   description TEXT NOT NULL,
   default_prompt TEXT,
@@ -92,7 +92,7 @@ CREATE TABLE challenge_tools (
 
 -- Defended Challenges (Team's defense configuration)
 CREATE TABLE defended_challenges (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   team_id UUID REFERENCES teams(id) ON DELETE CASCADE,
   challenge_id UUID REFERENCES challenges(id) ON DELETE CASCADE,
   system_prompt TEXT NOT NULL,
@@ -105,7 +105,7 @@ CREATE TABLE defended_challenges (
 
 -- Attacks
 CREATE TABLE attacks (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   attacker_user_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
   attacker_team_id UUID REFERENCES teams(id) ON DELETE CASCADE,
   defended_challenge_id UUID REFERENCES defended_challenges(id) ON DELETE CASCADE,
