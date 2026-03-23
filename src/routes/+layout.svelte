@@ -7,13 +7,24 @@ import { onMount, onDestroy } from 'svelte';
 let { children } = $props();
 
 let user = $state<any>(null);
+let profile = $state<any>(null);
 
 onMount(async () => {
 const { data: { session } } = await supabase.auth.getSession();
 user = session?.user || null;
+if (user) {
+const { data } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+profile = data;
+}
 
-const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
 user = session?.user || null;
+if (user) {
+const { data } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+profile = data;
+} else {
+profile = null;
+}
 });
 
 return () => {
@@ -45,7 +56,9 @@ await supabase.auth.signOut();
 </a>
 <nav class="ml-auto flex items-center space-x-6 text-sm font-semibold text-gray-300">
 <a href="/play" class="hover:text-white transition-colors">Player Hub</a>
-<a href="/admin" class="hover:text-white transition-colors">Admin Dashboard</a>
+{#if profile?.role === 'admin'}
+<a href="/admin" class="hover:text-white transition-colors border border-red-500/30 text-red-400 bg-red-500/10 px-3 py-1 rounded-md">Admin Dashboard</a>
+{/if}
 {#if user && !user.is_anonymous}
 <div class="flex items-center space-x-4">
 <span class="text-gray-400 font-normal">{user.email}</span>

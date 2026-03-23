@@ -10,6 +10,13 @@
   let recentAttacks = $state<any[]>([]);
   let loading = $state(true);
 
+  function isGameActive(gameData: { is_active: boolean; start_time: string; end_time: string }) {
+    const now = Date.now();
+    const start = new Date(gameData.start_time).getTime();
+    const end = new Date(gameData.end_time).getTime();
+    return Boolean(gameData.is_active) && !Number.isNaN(start) && !Number.isNaN(end) && now >= start && now <= end;
+  }
+
   onMount(async () => {
     await fetchDashboardData();
     
@@ -31,7 +38,7 @@
     if (g) game = g;
 
     // Fetch teams
-    const { data: t } = await supabase.from('teams').select('id, name, points').eq('game_id', gameId).order('points', { ascending: false });
+    const { data: t } = await supabase.from('teams').select('id, name, coins').eq('game_id', gameId).order('coins', { ascending: false });
     if (t) teams = t;
 
     // Fetch players (via team_members)
@@ -69,9 +76,16 @@
         <p class="text-gray-400 mt-2">
           {new Date(game.start_time).toLocaleString()} to {new Date(game.end_time).toLocaleString()}
         </p>
+        <p class="text-gray-300 mt-2 font-mono text-sm break-all">GAME:{game.id}</p>
+        {#if game.invite_code}
+          <p class="text-gray-300 mt-2">
+            Game Invite Code:
+            <span class="font-mono text-red-400 tracking-wider font-bold">{game.invite_code}</span>
+          </p>
+        {/if}
       </div>
-      <div class="px-4 py-2 {game.is_active ? 'bg-red-500/20 text-red-500 border-red-500/50' : 'bg-white/10 text-gray-400 border-white/20'} border rounded-full font-bold">
-        {game.is_active ? 'LIVE' : 'FINISHED/PAUSED'}
+      <div class="px-4 py-2 {isGameActive(game) ? 'bg-red-500/20 text-red-500 border-red-500/50' : 'bg-white/10 text-gray-400 border-white/20'} border rounded-full font-bold">
+        {isGameActive(game) ? 'LIVE' : 'INACTIVE'}
       </div>
     </div>
 
@@ -88,11 +102,14 @@
               <div class="p-4 flex items-center justify-between hover:bg-white/5 transition">
                 <div class="flex items-center space-x-4">
                   <span class="text-2xl font-bold text-gray-500 w-8">#{i + 1}</span>
-                  <span class="text-lg font-medium text-white">{team.name}</span>
+                  <div>
+                    <span class="text-lg font-medium text-white block">{team.name}</span>
+                    <span class="text-xs text-gray-400 font-mono break-all">TEAM:{team.id}</span>
+                  </div>
                 </div>
                 <div class="text-right">
-                  <span class="text-2xl font-bold text-red-500">{team.points}</span>
-                  <span class="text-sm text-gray-400 block uppercase tracking-wider">Points</span>
+                  <span class="text-2xl font-bold text-red-500">{team.coins ?? 0}</span>
+                  <span class="text-sm text-gray-400 block uppercase tracking-wider">Coins</span>
                 </div>
               </div>
             {/each}

@@ -15,9 +15,10 @@
     // Fetch challenges currently defended by other teams
     const { data } = await supabase
       .from('defended_challenges')
-      .select('id, lives_remaining, teams(name), challenges(id, description, type, model_name)')
+      .select('id, teams!inner(name, game_id, coins), challenges(id, description, type, model_name, attack_steal_coins)')
       .eq('is_active', true)
-      .gt('lives_remaining', 0);
+      .eq('teams.game_id', gameId)
+      .gt('teams.coins', 0);
       
     if (data) challenges = data;
   });
@@ -74,11 +75,8 @@
           >
             <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors">{target.teams?.name}</div>
             <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.model_name} • {target.challenges?.type}</div>
-            <div class="flex items-center space-x-1.5">
-              {#each Array(target.lives_remaining) as _}
-                <div class="w-2.5 h-2.5 rounded-sm bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]"></div>
-              {/each}
-            </div>
+            <div class="text-xs text-gray-300">Team Coins: {target.teams?.coins ?? 0}</div>
+            <div class="text-xs text-gray-500 mt-1">Steal on success: {target.challenges?.attack_steal_coins ?? 0}</div>
           </button>
         {/each}
       </div>
@@ -104,7 +102,7 @@
 
         <div class="flex-1 space-y-6 relative z-10">
           <div class="space-y-3">
-            <label class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Your Attack Prompt</label>
+            <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Your Attack Prompt</p>
             <textarea 
               bind:value={attackPrompt} 
               class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-48 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm leading-relaxed" 
@@ -113,7 +111,7 @@
 
           {#if selected.challenges?.type === 'secret-key'}
             <div class="space-y-3">
-              <label class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Secret Key Guess</label>
+              <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Secret Key Guess</p>
               <input 
                 bind:value={secretKeyGuess} 
                 class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm" 

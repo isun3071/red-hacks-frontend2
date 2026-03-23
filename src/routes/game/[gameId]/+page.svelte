@@ -1,0 +1,274 @@
+<script lang="ts">
+  import { page } from '$app/stores';
+  import { supabase } from '$lib/supabaseClient';
+  import { onMount } from 'svelte';
+
+  let gameId = $derived($page.params.gameId);
+  let game = $state<any>(null);
+  let myTeam = $state<any>(null);
+
+  let newTeamName = $state('');
+  let inviteCode = $state('');
+
+  let loading = $state(false);
+  let pageLoading = $state(true);
+  let actionMessage = $state('');
+  let actionError = $state(false);
+  let userId = $state('');
+
+  function normalizeInviteCode(rawValue: string) {
+    return rawValue.toUpperCase().trim().replace(/^TEAM:/, '').trim();
+  }
+
+  function isGameActive(gameData: { is_active: boolean; start_time: string; end_time: string }) {
+    const now = Date.now();
+    const start = new Date(gameData.start_time).getTime();
+    const end = new Date(gameData.end_time).getTime();
+    return Boolean(gameData.is_active) && !Number.isNaN(start) && !Number.isNaN(end) && now >= start && now <= end;
+  }
+
+  onMount(async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+
+    if (!session) {
+      await supabase.auth.signInAnonymously();
+    }
+
+    const { data: currentUser } = await supabase.auth.getUser();
+    if (!currentUser?.user) {
+      actionMessage = 'Could not load your account.';
+      actionError = true;
+      pageLoading = false;
+      return;
+    }
+
+    userId = currentUser.user.id;
+    await supabase.from('profiles').upsert({ id: userId, username: 'Player_' + userId.substring(0, 5) }, { onConflict: 'id' }).select();
+
+    const { data: gameRow } = await supabase
+      .from('games')
+      .select('id, name, invite_code, is_active, start_time, end_time')
+      .eq('id', gameId)
+      .maybeSingle();
+
+    if (!gameRow) {
+      actionMessage = 'Game not found.';
+      actionError = true;
+      pageLoading = false;
+      return;
+    }
+
+    game = gameRow;
+    await fetchUserData();
+    pageLoading = false;
+  });
+
+  async function fetchUserData() {
+    const { data: memberData } = await supabase
+      .from('team_members')
+      .select('role, teams!inner(*, games(id, name, is_active, start_time, end_time))')
+      .eq('user_id', userId)
+      .eq('teams.game_id', gameId)
+      .limit(1);
+
+    if (memberData && memberData.length > 0) {
+      const row = memberData[0] as any;
+      const team = Array.isArray(row.teams) ? row.teams[0] : row.teams;
+      const teamGame = Array.isArray(team?.games) ? team.games[0] : team?.games;
+      myTeam = team
+        ? {
+            ...team,
+            role: row.role,
+            game: teamGame
+          }
+        : null;
+    } else {
+      myTeam = null;
+    }
+  }
+
+  async function createTeam() {
+    if (!newTeamName) return;
+    if (!game || !isGameActive(game)) {
+      actionMessage = 'Team creation is only allowed while this game is active.';
+      actionError = true;
+      return;
+    }
+
+    if (myTeam) {
+      actionMessage = `You are already on ${myTeam.name} for this game.`;
+      actionError = true;
+      return;
+    }
+
+    loading = true;
+    actionError = false;
+
+    const newInviteCode = Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0').toUpperCase();
+
+    const { data: team, error: teamError } = await supabase
+      .from('teams')
+      .insert([
+        {
+          game_id: gameId,
+          name: newTeamName,
+          invite_code: newInviteCode
+        }
+      ])
+      .select()
+      .single();
+
+    if (teamError || !team) {
+      actionMessage = teamError?.message || 'Failed to create team.';
+      actionError = true;
+      loading = false;
+      return;
+    }
+
+    const { error: leaderInsertError } = await supabase.from('team_members').insert([
+      {
+        team_id: team.id,
+        user_id: userId,
+        role: 'leader'
+      }
+    ]);
+
+    if (leaderInsertError) {
+      await supabase.from('teams').delete().eq('id', team.id);
+      actionMessage = leaderInsertError.code === '23505' ? 'You are already on a team for this game.' : leaderInsertError.message;
+      actionError = true;
+      loading = false;
+      return;
+    }
+
+    actionMessage = `Team created! TEAM:${newInviteCode}`;
+    actionError = false;
+    newTeamName = '';
+    await fetchUserData();
+    loading = false;
+  }
+
+  async function joinTeam() {
+    if (!inviteCode) return;
+
+    loading = true;
+    actionError = false;
+
+    const { data: team, error: teamError } = await supabase
+      .from('teams')
+      .select('*')
+      .eq('invite_code', normalizeInviteCode(inviteCode))
+      .eq('game_id', gameId)
+      .single();
+
+    if (teamError || !team) {
+      actionMessage = 'Invalid invite code for this game.';
+      actionError = true;
+      loading = false;
+      return;
+    }
+
+    if (myTeam) {
+      actionMessage = `You are already on ${myTeam.name} for this game.`;
+      actionError = true;
+      loading = false;
+      return;
+    }
+
+    const { error: memberError } = await supabase.from('team_members').insert({
+      team_id: team.id,
+      user_id: userId,
+      role: 'member'
+    });
+
+    if (memberError) {
+      actionMessage = memberError.code === '23505' ? 'You are already on a team for this game.' : memberError.message;
+      actionError = true;
+    } else {
+      actionMessage = `Successfully joined ${team.name}!`;
+      actionError = false;
+      inviteCode = '';
+      await fetchUserData();
+    }
+
+    loading = false;
+  }
+</script>
+
+<div class="p-8 max-w-6xl mx-auto space-y-10">
+  {#if pageLoading}
+    <div class="text-gray-400">Loading game...</div>
+  {:else}
+    <div class="border-b border-white/10 pb-6">
+      <h1 class="text-4xl font-black tracking-tight text-white flex items-center gap-3">
+        <span class="text-red-500">🎮</span> {game?.name || 'Game'}
+      </h1>
+      <p class="text-gray-400 mt-2 text-lg">Everything for your run is scoped to this game.</p>
+      {#if game?.invite_code}
+        <p class="text-gray-300 mt-3">Game Invite Code: <span class="font-mono text-red-400 tracking-wider font-bold">{game.invite_code}</span></p>
+      {/if}
+    </div>
+
+    {#if actionMessage}
+      <div class="p-4 rounded-xl border {actionError ? 'bg-red-500/10 border-red-500/50 text-red-400' : 'bg-green-500/10 border-green-500/50 text-green-400'}">
+        {actionMessage}
+      </div>
+    {/if}
+
+    {#if myTeam}
+      <div class="border border-white/10 bg-slate-900/40 backdrop-blur-md p-6 rounded-2xl shadow-lg space-y-5">
+        <div class="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <p class="text-xs uppercase tracking-[0.2em] text-gray-500">Your Team</p>
+            <h2 class="font-black text-2xl text-white mt-1">{myTeam.name}</h2>
+            <p class="text-gray-400 mt-2">Role: <span class="text-gray-200">{myTeam.role}</span></p>
+            <p class="text-gray-300 mt-1">Coins: <span class="text-red-400 font-semibold">{myTeam.coins ?? 0}</span></p>
+          </div>
+          <span class="text-gray-300 font-mono text-xs break-all">TEAM:{myTeam.id}</span>
+        </div>
+
+        {#if myTeam.role === 'leader'}
+          <div class="text-sm bg-black/40 p-3 rounded-lg border border-white/5">
+            <span class="text-gray-400">Team Invite Code:</span>
+            <span class="ml-2 text-red-400 font-mono font-bold tracking-wider">TEAM:{myTeam.invite_code}</span>
+          </div>
+        {/if}
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <a href={`/game/${gameId}/team/${myTeam.id}`} class="text-center px-4 py-2 bg-white/10 hover:bg-white/20 text-gray-200 border border-white/20 rounded-lg font-bold text-sm transition-colors">Manage</a>
+          <a href={`/game/${gameId}/defend`} class="text-center px-4 py-2 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 rounded-lg font-bold text-sm transition-colors">Defend</a>
+          <a href={`/game/${gameId}/attack`} class="text-center px-4 py-2 bg-red-600/20 hover:bg-red-600/40 text-red-500 border border-red-500/30 rounded-lg font-bold text-sm transition-colors">Attack</a>
+        </div>
+      </div>
+    {:else}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="border border-white/10 bg-slate-900/50 backdrop-blur-md p-6 rounded-2xl shadow-xl flex flex-col justify-between">
+          <div>
+            <div class="w-12 h-12 bg-blue-500/10 rounded-full flex items-center justify-center mb-4 ring-1 ring-blue-500/30 text-2xl">🤝</div>
+            <h2 class="text-2xl font-bold text-white mb-2">Join a Team</h2>
+            <p class="text-gray-400 mb-6">Enter a team invite code for this game.</p>
+            <input bind:value={inviteCode} placeholder="E.g. TEAM:A1B2C3" class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white text-center text-xl tracking-[0.3em] font-mono uppercase focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all" maxlength="11" />
+          </div>
+          <button onclick={joinTeam} disabled={loading || normalizeInviteCode(inviteCode).length < 6} class="w-full bg-blue-600 hover:bg-blue-500 text-white px-6 py-4 rounded-xl font-bold disabled:opacity-50 transition-all text-lg tracking-wide mt-6">
+            {loading ? 'Joining...' : 'JOIN TEAM'}
+          </button>
+        </div>
+
+        <div class="border border-white/10 bg-slate-900/50 backdrop-blur-md p-6 rounded-2xl shadow-xl flex flex-col justify-between">
+          <div>
+            <div class="w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center mb-4 ring-1 ring-red-500/30 text-2xl">🛡️</div>
+            <h2 class="text-2xl font-bold text-white mb-2">Create a Team</h2>
+            <p class="text-gray-400 mb-6">Start a new squad in this game.</p>
+            <div class="space-y-2">
+              <label for="new-team-name" class="text-sm font-semibold text-gray-300">Team Name</label>
+              <input id="new-team-name" bind:value={newTeamName} placeholder="e.g. Protocol Breakers" class="w-full bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+            </div>
+          </div>
+          <button onclick={createTeam} disabled={loading || !newTeamName} class="w-full bg-red-600 hover:bg-red-500 text-white px-6 py-4 rounded-xl font-bold disabled:opacity-50 transition-all text-lg tracking-wide mt-6">
+            {loading ? 'Creating...' : 'CREATE TEAM'}
+          </button>
+        </div>
+      </div>
+    {/if}
+  {/if}
+</div>

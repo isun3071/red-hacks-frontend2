@@ -6,80 +6,99 @@
   let gameId = $derived($page.params.gameId);
   let challenges = $state<any[]>([]);
   let defended = $state<any[]>([]);
-  let loading = $state(false);
+  let loading = $state(true);
   let teamId = $state('');
+  let statusError = $state('');
 
   onMount(async () => {
-    // Basic setup - fetch challenges and already defended ones
-    const { data: c } = await supabase.from('challenges').select('*');
-    if (c) challenges = c;
-
-    // Get current user's team for this game
-    const { data: user } = await supabase.auth.getUser();
-    if (user.user) {
-      const { data: member } = await supabase.from('team_members')
-        .select('team_id, teams!inner(game_id)')
-        .eq('user_id', user.user.id)
-        .eq('teams.game_id', gameId)
-        .single();
-      
-      if (member) {
-        teamId = member.team_id;
-        const { data: d } = await supabase.from('defended_challenges').select('*').eq('team_id', teamId);
-        if (d) defended = d;
-      }
-    }
+    await loadPage();
   });
 
-  async function defendChallenge(challengeId: string) {
-    // In a real app we'd open a modal. Doing it directly for simplicity.
-    const prompt = window.prompt("Enter your system prompt to defend this challenge:");
-    if (!prompt) return;
+  async function loadPage() {
+    loading = true;
+    statusError = '';
 
-    const { data, error } = await supabase.from('defended_challenges').insert([{
-      team_id: teamId,
-      challenge_id: challengeId,
-      system_prompt: prompt,
-      lives_remaining: 3 // Should normally come from games.lives_per_challenge
-    }]);
-
-    if (!error) {
-      alert("Defense deployed!");
-      window.location.reload();
-    } else {
-      alert("Error: " + error.message);
+    const { data: userData } = await supabase.auth.getUser();
+    if (!userData.user) {
+      statusError = 'You must be signed in to configure defenses.';
+      loading = false;
+      return;
     }
+
+    const { data: member, error: memberError } = await supabase
+      .from('team_members')
+      .select('team_id, teams!inner(game_id)')
+      .eq('user_id', userData.user.id)
+      .eq('teams.game_id', gameId)
+      .single();
+
+    if (memberError || !member) {
+      statusError = 'Could not find your team for this game.';
+      loading = false;
+      return;
+    }
+
+    teamId = member.team_id;
+
+    const [{ data: challengeRows }, { data: defendedRows }] = await Promise.all([
+      supabase.from('challenges').select('id, model_name, description, type, defense_reward_coins, attack_steal_coins').order('created_at', { ascending: true }),
+      supabase
+        .from('defended_challenges')
+        .select('id, challenge_id, system_prompt, is_active, created_at')
+        .eq('team_id', teamId)
+    ]);
+
+    challenges = challengeRows ?? [];
+    defended = defendedRows ?? [];
+
+    loading = false;
   }
 </script>
 
-<div class="p-8 max-w-4xl mx-auto space-y-8">
-  <h1 class="text-3xl font-bold tracking-tight text-white">Blue Team: Defend Challenges</h1>
-  <p class="text-gray-400">Select up to 5 challenges to protect. Write a robust system prompt to prevent attackers from finding the secret key or calling the forbidden tool.</p>
-
-  <div class="grid grid-cols-1 gap-4 mt-8">
-    {#each challenges as challenge}
-      {@const isDefended = defended.find(d => d.challenge_id === challenge.id)}
-      <div class="border border-white/10 bg-black/40 p-6 rounded-lg flex justify-between items-center">
-        <div>
-          <h3 class="text-xl font-bold text-white">{challenge.model_name} <span class="text-sm font-normal text-gray-400">({challenge.type})</span></h3>
-          <p class="text-gray-400 mt-2">{challenge.description}</p>
-          {#if isDefended}
-            <div class="mt-4 p-3 bg-white/5 border border-white/10 rounded-md">
-              <p class="text-xs text-red-500 font-bold mb-1">YOUR CURRENT SYSTEM PROMPT:</p>
-              <p class="text-sm text-gray-300 font-mono">"{isDefended.system_prompt}"</p>
-              <div class="mt-2 text-xs text-gray-500">Lives Remaining: {isDefended.lives_remaining}</div>
-            </div>
-          {/if}
-        </div>
-        
-        <div class="ml-6 flex-shrink-0">
-          {#if isDefended}
-            <button class="bg-gray-700 text-gray-300 px-4 py-2 rounded-md font-bold cursor-not-allowed">DEFENDED</button>
-          {:else}
-            <button onclick={() => defendChallenge(challenge.id)} class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md font-bold transition">DEPLOY DEFENSE</button>
-          {/if}
-        </div>
-      </div>
-    {/each}
+<div class="p-8 max-w-7xl mx-auto space-y-8">
+  <div class="border-b border-white/10 pb-6">
+    <h1 class="text-4xl font-black tracking-tight text-white mb-2">Blue Team: Defense Console</h1>
+    <p class="text-gray-400 text-lg">Choose a challenge to open its dedicated defense options page.</p>
   </div>
+
+  {#if loading}
+    <div class="border border-white/10 bg-black/40 rounded-xl p-8 text-gray-300">Loading challenges...</div>
+  {:else if statusError && !teamId}
+    <div class="border border-red-500/40 bg-red-500/10 rounded-xl p-6 text-red-300">{statusError}</div>
+  {:else}
+    <div class="border border-white/10 bg-slate-900/50 rounded-xl overflow-hidden">
+      <div class="p-4 border-b border-white/10 bg-black/40">
+        <h2 class="text-xs font-bold text-gray-400 tracking-widest uppercase">Challenges</h2>
+      </div>
+      {#if challenges.length === 0}
+        <div class="p-6 text-gray-400">No challenges are available for this game yet.</div>
+      {:else}
+        <div class="divide-y divide-white/5">
+          {#each challenges as challenge}
+            {@const challengeDefense = defended.find((d) => d.challenge_id === challenge.id)}
+            <a
+              href={`/game/${gameId}/defend/${challenge.id}`}
+              class="block p-5 hover:bg-white/5 transition"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div class="font-semibold text-white">{challenge.model_name}</div>
+                  <div class="text-xs text-gray-400 mt-1">{challenge.type}</div>
+                </div>
+                <div class="text-xs">
+                  {#if challengeDefense}
+                    <span class="text-emerald-300">Deployed • +{challenge.defense_reward_coins ?? 0} defense coins</span>
+                  {:else}
+                    <span class="text-gray-500">Not defended yet</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="text-xs text-gray-500 mt-2">Steal value if breached: {challenge.attack_steal_coins ?? 0} coins</div>
+              <div class="text-sm text-gray-500 mt-3">{challenge.description}</div>
+            </a>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>
