@@ -125,7 +125,7 @@
       } else {
         const { data, error } = await supabase
           .from('challenges')
-          .select('id, description, type, model_name, attack_steal_coins, default_prompt, *')
+          .select('id, name, description, type, model_name, attack_steal_coins, default_prompt, *')
           .in('id', allowedChallengeIds);
 
         if (error) {
@@ -196,7 +196,7 @@
             onclick={() => selectedChallengeId = target.id}
           >
             <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors">{target.teams?.name || 'Default Defense'}</div>
-            <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.model_name} • {target.challenges?.type}</div>
+            <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.name || target.challenges?.model_name} • {target.challenges?.type}</div>
             <div class="text-xs mb-2 {target.is_active ? 'text-emerald-300' : 'text-amber-300'}">{target.is_active ? 'Active Defense' : 'Inactive Defense'}</div>
             <div class="text-xs text-gray-300">{attackMode === 'pvp' ? `Team Coins: ${target.teams?.coins ?? 0}` : 'Default prompt target'}</div>
             <div class="text-xs text-gray-500 mt-1">Steal on success: {target.challenges?.attack_steal_coins ?? 0}</div>
@@ -222,7 +222,7 @@
               <p class="text-sm text-gray-400 leading-relaxed max-w-xl">{selected.challenges?.description}</p>
             </div>
             <span class="px-3 py-1 bg-black/40 border border-white/10 rounded-full text-xs font-mono text-gray-300">
-              {selected.challenges?.model_name}
+              {selected.challenges?.name || selected.challenges?.model_name}
             </span>
           </div>
           {#if selected.challenges?.challenge_url}

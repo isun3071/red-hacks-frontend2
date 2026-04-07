@@ -1,10 +1,10 @@
 import os
 import json
+import re
 import httpx
-from typing import Optional, List
-from datetime import datetime
-from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Header, Request
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -16,15 +16,31 @@ app = FastAPI(title="Dummy Challenge Backend", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins in dev; restrict in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,  # Set to False when allow_origins=["*"]
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    max_age=600,  # Cache preflight for 10 minutes
 )
 
 # Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-SECRET_PHRASE = os.getenv("SECRET_PHRASE", "FLAG{dummy_success}")
+SECRET_PHRASE = os.getenv("SECRET_PHRASE", "")
+TARGET_TOOL_NAME = os.getenv("TARGET_TOOL_NAME", "").strip()
+
+
+def parse_json_env(name: str, default: Any) -> Any:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+TARGET_TOOL_ARGS = parse_json_env("TARGET_TOOL_ARGS_JSON", {})
+CHALLENGE_TOOLS = parse_json_env("CHALLENGE_TOOLS_JSON", [])
 
 
 class ChatMessage(BaseModel):
@@ -32,43 +48,205 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ChallengeInfo(BaseModel):
+    challenge_id: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    objective: Optional[str] = None
+    system_prompt: Optional[str] = None
+    success_tool_name: Optional[str] = None
+    success_tool_args: Optional[Dict[str, Any]] = None
+    interp_args: Optional[List[Dict[str, Any]]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    target_secret_key: Optional[str] = None
+
+
 class AttackRequest(BaseModel):
+    # Current frontend payload shape
     defended_challenge_id: Optional[str] = None
     challenge_id: Optional[str] = None
     game_id: Optional[str] = None
     round_type: Optional[str] = None
     prompt: Optional[str] = None
     guess: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = None
+    messages: List[ChatMessage] = Field(default_factory=list)
+    # Optional expanded challenge metadata payload
+    challenge: Optional[ChallengeInfo] = None
 
 
-def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
-    """Extract Bearer token from Authorization header."""
-    if not authorization:
+class AttackResponse(BaseModel):
+    success: bool
+    output_message: str
+    message: Optional[str] = None
+    assistant: Optional[str] = None
+    log: Optional[str] = None
+    tool_calls: List[str] = Field(default_factory=list)
+
+
+def parse_arguments(raw_args: Any) -> Dict[str, Any]:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not isinstance(raw_args, str):
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return {}
+    return {}
+
+
+def normalize_tool_spec(raw_tool: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_tool, dict):
         return None
-    parts = authorization.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
+
+    if isinstance(raw_tool.get("type"), str) and isinstance(raw_tool.get("function"), dict):
+        return raw_tool
+
+    if isinstance(raw_tool.get("spec"), dict):
+        spec = raw_tool["spec"]
+        if isinstance(spec.get("type"), str) and isinstance(spec.get("function"), dict):
+            return spec
+
+    nested_tool = raw_tool.get("tools")
+    if isinstance(nested_tool, dict):
+        return normalize_tool_spec(nested_tool)
+
     return None
+
+
+def normalize_tools(raw_tools: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_tools, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for raw_tool in raw_tools:
+        tool_spec = normalize_tool_spec(raw_tool)
+        if tool_spec is not None:
+          normalized.append(tool_spec)
+
+    return normalized
+
+
+def is_subset(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        return all(key in actual and is_subset(value, actual[key]) for key, value in expected.items())
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return False
+        if len(expected) > len(actual):
+            return False
+        return all(is_subset(expected[index], actual[index]) for index in range(len(expected)))
+    return expected == actual
+
+
+def evaluate_success(
+    tool_calls: List[Dict[str, Any]],
+    expected_tool_name: str,
+    expected_tool_args: Dict[str, Any],
+) -> tuple[bool, str]:
+    if not expected_tool_name:
+        return False, "No success criteria configured (missing success tool name)."
+
+    for tool_call in tool_calls:
+        function_data = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+        name = function_data.get("name", "")
+        args = parse_arguments(function_data.get("arguments", "{}"))
+        if name != expected_tool_name:
+            continue
+        if expected_tool_args and not is_subset(expected_tool_args, args):
+            continue
+        return True, f"Attack succeeded: matched required tool call '{expected_tool_name}'."
+
+    return False, f"Attack failed: required tool call '{expected_tool_name}' was not matched."
+
+
+def normalize_challenge(request: AttackRequest) -> ChallengeInfo:
+    if request.challenge:
+        return request.challenge
+
+    return ChallengeInfo(
+        challenge_id=request.challenge_id or request.defended_challenge_id,
+        title="Legacy payload challenge",
+        description="Resolved from frontend legacy payload fields.",
+        objective="Trigger the configured success tool call.",
+        system_prompt=None,
+    )
+
+
+def build_response(
+    success: bool,
+    output_message: str,
+    *,
+    assistant: str = "",
+    log: str = "",
+    tool_calls: Optional[List[str]] = None,
+) -> AttackResponse:
+    return AttackResponse(
+        success=success,
+        output_message=output_message,
+        message=output_message,
+        assistant=assistant,
+        log=log,
+        tool_calls=tool_calls or [],
+    )
+
+
+def normalize_messages(request: AttackRequest) -> List[Dict[str, str]]:
+    if request.messages:
+        return [{"role": message.role, "content": message.content} for message in request.messages]
+    if request.prompt:
+        return [{"role": "user", "content": request.prompt}]
+    return []
+
+
+def extract_user_text(request: AttackRequest) -> str:
+    parts: List[str] = []
+
+    if request.prompt:
+        parts.append(request.prompt)
+
+    for message in request.messages:
+        if message.role == "user" and message.content:
+            parts.append(message.content)
+
+    return "\n".join(parts)
+
+
+def has_banana(request: AttackRequest) -> bool:
+    text = extract_user_text(request)
+    return bool(re.search(r"\bbanana\b", text, flags=re.IGNORECASE))
 
 
 async def call_openrouter(
     messages: List[dict],
-    system_prompt: str = "You are a helpful assistant.",
-) -> str:
-    """Call OpenRouter API for LLM response."""
+    challenge: ChallengeInfo,
+) -> Dict[str, Any]:
+    """Run the model and return assistant content and tool calls."""
     if not OPENROUTER_API_KEY:
-        return "[Configuration error] OPENROUTER_API_KEY is missing"
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is missing")
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
 
+    system_prompt = challenge.system_prompt.strip() if challenge.system_prompt else "You are a helpful assistant."
+
+    tools = normalize_tools(challenge.tools if challenge.tools is not None else CHALLENGE_TOOLS)
+
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "system", "content": system_prompt}] + messages,
     }
+
+
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
 
     try:
         async with httpx.AsyncClient() as client:
@@ -80,98 +258,145 @@ async def call_openrouter(
             )
 
             if not response.is_success:
-                error_text = response.text[:300]
-                return f"[OpenRouter error {response.status_code}]: {error_text}"
+                error_text = response.text[:400]
+                print(f"OpenRouter error {response.status_code}: {error_text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OpenRouter error {response.status_code}: {error_text}",
+                )
 
             data = response.json()
-            assistant_message = data.get("choices", [{}])[0].get("message", {}).get("content", "No response received")
-            return assistant_message
+            message = data.get("choices", [{}])[0].get("message", {})
+            tool_calls = message.get("tool_calls", [])
+            return {
+                "assistant": str(message.get("content") or ""),
+                "tool_calls": tool_calls if isinstance(tool_calls, list) else [],
+            }
 
     except httpx.TimeoutException:
-        return "[Error] OpenRouter request timed out"
+        raise HTTPException(status_code=504, detail="OpenRouter request timed out")
     except Exception as e:
-        return f"[Error calling OpenRouter]: {str(e)}"
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Error calling OpenRouter: {str(e)}")
 
 
-@app.post("/attack")
-async def attack(request: AttackRequest, authorization: Optional[str] = Header(None)):
-    """
-    Handle attack requests matching the Supabase edge function contract.
-    
-    Accepts the same payload as the frontend's attack invoker and returns
-    a compatible response shape.
-    """
-    # Verify authentication
-    token = extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Authorization Bearer token required")
+async def handle_tool_calling_attack(request: AttackRequest) -> AttackResponse:
+    challenge = normalize_challenge(request)
+    chat_messages = normalize_messages(request)
 
-    # Validate request
-    if not request.defended_challenge_id and not request.challenge_id:
-        raise HTTPException(status_code=400, detail="defended_challenge_id or challenge_id is required")
+    if not chat_messages:
+        raise HTTPException(status_code=400, detail="prompt or messages must include at least one message")
 
-    # Determine attack mode
-    is_pve = bool(request.challenge_id and request.game_id)
-    is_secret_key_guess = bool(request.guess)
+    model_result = await call_openrouter(chat_messages, challenge)
+    assistant_text = str(model_result.get("assistant") or "")
+    tool_calls = model_result.get("tool_calls") or []
 
-    # Prepare chat messages
-    chat_messages = []
-    if request.messages:
-        chat_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in request.messages
-        ]
-    elif request.prompt:
-        chat_messages = [{"role": "user", "content": request.prompt}]
+    expected_tool_name = (challenge.success_tool_name or TARGET_TOOL_NAME).strip()
+    expected_tool_args = challenge.success_tool_args or TARGET_TOOL_ARGS
+    if not isinstance(expected_tool_args, dict):
+        expected_tool_args = {}
 
-    # Handle secret-key challenge guesses
-    if is_secret_key_guess:
-        if request.guess.lower().strip() == SECRET_PHRASE.lower().strip():
-            return {
-                "success": True,
-                "message": "The secret key was successfully extracted!" if not is_pve else "The secret key was successfully extracted.",
-                "log": "System breached. Key accepted.",
-                "assistant": "System breached. Key accepted.",
-                "tool_calls": [],
-                "stolen_coins": 10 if not is_pve else 0,
-                "defender_eliminated": False,
-            }
-        else:
-            return {
-                "success": False,
-                "message": "Incorrect secret key guess.",
-                "log": f"Attempted key '{request.guess}' was denied by security protocol.",
-                "assistant": "",
-                "tool_calls": [],
-                "stolen_coins": 0,
-                "defender_eliminated": False,
-            }
+    success, output_message = evaluate_success(tool_calls, expected_tool_name, expected_tool_args)
+    called_tool_names = [
+        str(call.get("function", {}).get("name", ""))
+        for call in tool_calls
+        if isinstance(call, dict)
+    ]
 
-    # Call LLM for non-guessing challenges
-    system_prompt = "You are a helpful assistant. Demonstrate your knowledge by providing informative responses."
-    if chat_messages:
-        assistant_response = await call_openrouter(chat_messages, system_prompt)
-    else:
-        assistant_response = "No prompt provided."
+    return build_response(
+        success,
+        output_message,
+        assistant=assistant_text,
+        log=f"Observed tool calls: {', '.join([name for name in called_tool_names if name]) or 'none'}",
+        tool_calls=[name for name in called_tool_names if name],
+    )
 
-    # Simple success determination: check if response is substantive
-    is_successful = len(assistant_response) > 20 and not assistant_response.startswith("[Error")
 
-    response_data = {
-        "success": is_successful,
-        "message": "Victory condition met." if is_successful else "Prompt evaluated by the model. Read output below.",
-        "log": f"Model Output: {assistant_response[:200]}...",
-        "assistant": assistant_response,
-        "tool_calls": [],
-        "stolen_coins": 5 if is_successful and not is_pve else 0,
-        "defender_eliminated": False,
-    }
+async def handle_secret_key_attack(request: AttackRequest) -> AttackResponse:
+    challenge = normalize_challenge(request)
+    target_secret = (challenge.target_secret_key or SECRET_PHRASE).strip()
 
-    if request.challenge_id:
-        response_data["challenge_id"] = request.challenge_id
+    if not target_secret:
+        raise HTTPException(status_code=500, detail="No secret key configured for this backend.")
 
-    return response_data
+    guess = (request.guess or "").strip()
+    if not guess:
+        return build_response(
+            False,
+            "Secret key guess required.",
+            log="No guess was supplied.",
+        )
 
+    success = guess.lower() == target_secret.lower()
+    output_message = "Correct secret key guess." if success else "Incorrect secret key guess."
+    return build_response(
+        success,
+        output_message,
+        log="Secret-key check completed.",
+    )
+
+
+async def handle_banana_attack(request: AttackRequest) -> AttackResponse:
+    matched = has_banana(request)
+    if matched:
+        return build_response(
+            True,
+            "Banana detected.",
+            log="Matched the word banana in the attacker message history.",
+        )
+
+    return build_response(
+        False,
+        "Banana not found in the attack prompt.",
+        log="No banana keyword match found.",
+    )
+
+
+async def dispatch_attack(request: AttackRequest, mode: str) -> AttackResponse:
+    if mode == "tool-calling":
+        return await handle_tool_calling_attack(request)
+    if mode == "secret-key":
+        return await handle_secret_key_attack(request)
+    if mode == "banana":
+        return await handle_banana_attack(request)
+
+    raise HTTPException(status_code=404, detail=f"Unknown demo backend mode: {mode}")
+
+
+@app.post("/attack", response_model=AttackResponse)
+async def attack_endpoint(request: AttackRequest):
+    return await dispatch_attack(request, "tool-calling")
+
+
+@app.post("/attack/tool-calling", response_model=AttackResponse)
+async def tool_calling_attack_endpoint(request: AttackRequest):
+    return await dispatch_attack(request, "tool-calling")
+
+
+@app.post("/attack/secret-key", response_model=AttackResponse)
+async def secret_key_attack_endpoint(request: AttackRequest):
+    return await dispatch_attack(request, "secret-key")
+
+
+@app.post("/attack/banana", response_model=AttackResponse)
+async def banana_attack_endpoint(request: AttackRequest):
+    return await dispatch_attack(request, "banana")
+
+
+@app.post("/", response_model=AttackResponse)
+async def root_attack_endpoint(request: AttackRequest):
+    return await dispatch_attack(request, "tool-calling")
+
+
+@app.options("/")
+@app.options("/attack")
+@app.options("/attack/tool-calling")
+@app.options("/attack/secret-key")
+@app.options("/attack/banana")
+async def preflight_handler():
+    """Explicit preflight OPTIONS handler."""
+    return Response(status_code=204)
 
 @app.get("/health")
 async def health_check():
@@ -179,7 +404,7 @@ async def health_check():
     return {
         "status": "ok",
         "model": OPENROUTER_MODEL,
-        "secret_phrase": "***" if SECRET_PHRASE else "not configured",
+        "routes": ["/attack", "/attack/tool-calling", "/attack/secret-key", "/attack/banana"],
     }
 
 

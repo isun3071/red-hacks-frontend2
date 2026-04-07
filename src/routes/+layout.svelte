@@ -34,7 +34,7 @@ profile = null;
 return;
 }
 
-await supabase
+const { error: profileUpsertError } = await supabase
 	.from('profiles')
 	.upsert(
 		{
@@ -44,6 +44,27 @@ await supabase
 		{ onConflict: 'id' }
 	)
 	.select();
+
+if (profileUpsertError) {
+	const isMissingAuthUser =
+		profileUpsertError.code === '23503' ||
+		profileUpsertError.message?.includes('profiles_id_fkey');
+
+	if (isMissingAuthUser) {
+		// Local auth sessions can survive DB resets; force re-auth if user row no longer exists.
+		await supabase.auth.signOut();
+		user = null;
+		profile = null;
+		if (window.location.pathname !== '/') {
+			goto('/');
+		}
+		return;
+	}
+
+	console.error('Unable to bootstrap profile', profileUpsertError);
+	profile = null;
+	return;
+}
 
 const { data } = await supabase
 	.from('profiles')

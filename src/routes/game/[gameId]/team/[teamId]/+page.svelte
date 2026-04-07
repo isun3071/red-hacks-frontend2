@@ -9,7 +9,7 @@
     user_id: string;
     role: 'leader' | 'member';
     joined_at: string;
-    profiles: { username: string | null }[] | null;
+    profiles: { full_name: string | null; username: string | null }[] | null;
   };
 
   let gameId = $derived($page.params.gameId);
@@ -81,7 +81,7 @@
 
     const { data: memberRows, error: membersError } = await supabase
       .from('team_members')
-      .select('id, user_id, role, joined_at, profiles(username)')
+      .select('id, user_id, role, joined_at, profiles(full_name, username)')
       .eq('team_id', teamId)
       .order('joined_at', { ascending: true });
 
@@ -98,7 +98,7 @@
 
   function memberLabel(member: TeamMember) {
     if (member.user_id === userId) return 'You';
-    return member.profiles?.[0]?.username || member.user_id.slice(0, 8);
+    return member.profiles?.[0]?.full_name || member.profiles?.[0]?.username || member.user_id.slice(0, 8);
   }
 
   async function renameTeam() {

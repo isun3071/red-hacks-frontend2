@@ -124,15 +124,135 @@ Common attack args include:
 - Conversation messages/history
 - Optional guess/answer fields
 - Target identifiers (depends on mode)
+- Resolved challenge details for custom backends
 
 Routing decision:
-1. Resolve target challenge.
-2. If `challenge_url` exists, call it directly with the same body args and auth headers expected by the edge-function path.
-3. Else call Supabase Edge Function (`attack`).
+1. The browser posts attack intent to the same-origin SvelteKit attack dispatcher.
+2. The dispatcher resolves the target challenge server-side and attaches the fully resolved challenge object, including server-only fields such as `target_secret_key` for secret-key challenges.
+3. If `challenge_url` exists, the dispatcher calls it directly with the resolved body args.
+4. Else call Supabase Edge Function (`attack`).
 
 Design intent:
 - Lets challenge authors provide specialized evaluators/backends without changing client attack UX.
 - Preserves a common payload format across default and custom backends.
+
+### 6.1 Direct challenge_url Request Contract
+
+When `challenge_url` is present, the frontend sends:
+
+- Method: `POST`
+- Headers:
+  - `Content-Type: application/json`
+- Endpoint: whatever exact `challenge_url` value is configured (frontend does not append `/attack`)
+
+Recommended configuration:
+- Set `challenge_url` to the full attack route (for example `https://your-backend/attack`).
+- Some backends may provide a root-path compatibility alias (`POST /`) to avoid accidental 404s.
+
+Frontend behavior note:
+- The attack page sends requests to the same-origin attack dispatcher, not to the custom backend directly.
+- The dispatcher resolves the challenge payload server-side, so the browser never needs access to `target_secret_key` or other secret challenge fields.
+- The direct-backend payload includes the challenge data the server already resolved from Supabase, so the backend does not need to fetch challenge metadata itself.
+- The backend returns whether the attack was successful and the message plus any tool calls.
+
+Body follows the existing attack contract.
+
+PvP shape:
+
+```json
+{
+  "defended_challenge_id": "uuid",
+  "prompt": "latest user message",
+  "guess": "optional",
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "challenge": {
+    "challenge_id": "uuid",
+    "title": "optional",
+    "description": "optional",
+    "objective": "optional",
+    "system_prompt": "resolved defender prompt",
+    "success_tool_name": "required-for-tool-calling-eval",
+    "success_tool_args": {"key": "value"},
+    "tools": [],
+    "target_secret_key": "FLAG{...}"
+  }
+}
+```
+
+PvE shape:
+
+```json
+{
+  "challenge": {
+    "challenge_id": "uuid",
+    "title": "optional",
+    "description": "optional",
+    "objective": "optional",
+    "system_prompt": "resolved defender prompt",
+    "success_tool_name": "required-for-tool-calling-eval",
+    "success_tool_args": {"key": "value"},
+    "tools": [],
+    "target_secret_key": null
+  },
+  "prompt": "latest user message",
+  "guess": "optional",
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+Resolved challenge details for custom backends:
+
+```json
+{
+  "challenge": {
+    "challenge_id": "uuid",
+    "title": "optional",
+    "description": "optional",
+    "objective": "optional",
+    "system_prompt": "resolved defender prompt",
+    "success_tool_name": "required-for-tool-calling-eval",
+    "success_tool_args": {"key": "value"},
+    "tools": [],
+    "target_secret_key": "FLAG{...}"
+  }
+}
+```
+
+`challenge.system_prompt` should represent the defender/admin prompt selected by game logic:
+- PvP: defended challenge `system_prompt`
+- PvE: challenge `default_prompt`
+
+### 6.2 Direct challenge_url Response Contract
+
+Minimum:
+
+```json
+{
+  "success": true,
+  "output_message": "Short result"
+}
+```
+
+Recommended frontend-compatible response:
+
+```json
+{
+  "success": true,
+  "output_message": "Short result",
+  "message": "Short result",
+  "assistant": "Optional assistant text",
+  "log": "Optional diagnostics",
+  "tool_calls": ["tool_name"]
+}
+```
+
+Error responses should include `error` or `message` fields so UI can show the backend reason.
 
 ## 7) Round + Challenge Validity Rules
 
@@ -168,7 +288,7 @@ Expected behavior:
 
 - PvP: players attack other teams defended challenges to steal coins.
 - PvE: players attack challenges defended by the default prompt.
-- `challenge_url` present: bypass Supabase attack edge function and call the challenge backend directly with the same args.
+- `challenge_url` present: the same-origin attack dispatcher resolves the challenge server-side, then calls the challenge backend directly with the same args.
 - Round definitions determine legal challenge targets and mode behavior.
 
 ## 10) Implementation Notes
@@ -176,5 +296,5 @@ Expected behavior:
 For this repository, keep these behaviors aligned across UI and backend:
 - Round filter is authoritative for what can be attacked.
 - Attack mode (`pvp` vs `pve`) controls target resolution.
-- Direct backend (`challenge_url`) and edge function paths should stay payload-compatible.
+- Direct backend (`challenge_url`) and edge function paths should stay payload-compatible, with the server route supplying resolved challenge data.
 - Critical checks (authorization, validity, transfer) must remain server-side.

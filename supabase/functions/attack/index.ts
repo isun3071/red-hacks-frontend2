@@ -130,11 +130,16 @@ Deno.serve(async (req) => {
   console.log('hit attack function endpoint')
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Max-Age': '86400',
   }
   
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+    return new Response(null, { 
+      status: 204,
+      headers: corsHeaders 
+    })
   }
 
   try {
@@ -616,9 +621,23 @@ Deno.serve(async (req) => {
            throw new Error(`LLM API returned ${response.status} ${response.statusText}: ${errorBody.slice(0, 300)}`);
         }
         
-        const data = await response.json();
+        let data = null;
+        try {
+          data = await response.json();
+        } catch (parseErr) {
+          throw new Error(`LLM API returned invalid JSON: ${await response.text().slice(0, 300)}`);
+        }
+        
+        if (!data || typeof data !== 'object' || !Array.isArray(data.choices)) {
+          throw new Error(`LLM API returned unexpected response format: ${JSON.stringify(data).slice(0, 300)}`);
+        }
+        
         const assistantMessage = data.choices?.[0]?.message
-        openAiResponse = assistantMessage?.content || 'No response received';
+        if (!assistantMessage || typeof assistantMessage.content !== 'string') {
+          throw new Error('LLM API returned message without content field');
+        }
+        
+        openAiResponse = assistantMessage.content;
         calledTools = extractToolCallNames(assistantMessage)
 
         if (challenges.type === 'tool-calling' && challenges.target_tool_name) {

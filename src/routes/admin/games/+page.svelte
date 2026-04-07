@@ -288,7 +288,7 @@
   async function fetchChallenges() {
     const { data, error } = await supabase
       .from('challenges')
-      .select('id, model_name, type, description')
+      .select('id, name, model_name, type, description')
       .order('created_at', { ascending: true });
 
     if (error) {
@@ -876,7 +876,7 @@
                   class="mt-0.5"
                 />
                 <span class="text-sm text-gray-200">
-                  <span class="font-semibold text-white">{challenge.model_name}</span>
+                  <span class="font-semibold text-white">{challenge.name || challenge.model_name}</span>
                   <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
                   <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
                 </span>
@@ -950,7 +950,7 @@
                       class="mt-0.5"
                     />
                     <span class="text-sm text-gray-200">
-                      <span class="font-semibold text-white">{challenge.model_name}</span>
+                      <span class="font-semibold text-white">{challenge.name || challenge.model_name}</span>
                       <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
                       <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
                     </span>
@@ -1133,7 +1133,7 @@
                 class="mt-0.5"
               />
               <span class="text-sm text-gray-200">
-                <span class="font-semibold text-white">{challenge.model_name}</span>
+                <span class="font-semibold text-white">{challenge.name || challenge.model_name}</span>
                 <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
                 <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
               </span>

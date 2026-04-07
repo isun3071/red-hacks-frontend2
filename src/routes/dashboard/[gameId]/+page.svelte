@@ -36,10 +36,10 @@
     if (t) teams = t;
 
     // Fetch players (via team_members)
-    // Note: requires a join to get username which is in profiles
+    // Prefer the profile name, with username as a fallback for older accounts.
     const { data: p } = await supabase
       .from('team_members')
-      .select('kills, profiles(username), teams!inner(game_id)')
+      .select('kills, profiles(full_name, username), teams!inner(game_id)')
       .eq('teams.game_id', gameId)
       .order('kills', { ascending: false })
       .limit(10);
@@ -48,7 +48,7 @@
     // Fetch recent activity
     const { data: a } = await supabase
       .from('attacks')
-      .select('is_successful, created_at, profiles!attacks_attacker_user_id_fkey(username), defended_challenges!inner(challenge_id, teams!inner(game_id, name))')
+      .select('is_successful, created_at, profiles!attacks_attacker_user_id_fkey(full_name, username), defended_challenges!inner(challenge_id, teams!inner(game_id, name))')
       .eq('defended_challenges.teams.game_id', gameId)
       .order('created_at', { ascending: false })
       .limit(5);
@@ -122,7 +122,7 @@
               <div class="p-4 flex items-center justify-between">
                 <div class="flex items-center space-x-4">
                   <span class="text-gray-400 w-6">#{i + 1}</span>
-                  <span class="text-md text-white">{player.profiles?.username || 'Unknown'}</span>
+                  <span class="text-md text-white">{player.profiles?.full_name || player.profiles?.username || 'Unknown'}</span>
                 </div>
                 <div class="font-bold text-white">{player.kills} <span class="text-xs text-gray-500 font-normal">KILLS</span></div>
               </div>
@@ -141,7 +141,7 @@
             {#each recentAttacks as attack}
               <div class="border-l-2 pl-3 pb-2 {attack.is_successful ? 'border-red-500' : 'border-gray-500'}">
                 <p class="text-sm text-white">
-                  <span class="font-bold">{attack.profiles?.username || 'Someone'}</span> 
+                  <span class="font-bold">{attack.profiles?.full_name || attack.profiles?.username || 'Someone'}</span> 
                   attacked 
                   <span class="font-bold">{attack.defended_challenges?.teams?.name || 'Unknown Team'}</span>
                 </p>

@@ -94,7 +94,7 @@
     const [{ data: gameChallengeRows, error: challengeListError }, { data: defendedRows, error: defendedListError }] = await Promise.all([
       supabase
         .from('game_challenges')
-        .select('challenge_id, challenges!inner(id, model_name, description, type, defense_reward_coins, attack_steal_coins, created_at)')
+        .select('challenge_id, challenges!inner(id, name, model_name, description, type, defense_reward_coins, attack_steal_coins, created_at)')
         .eq('game_id', gameId),
       supabase
         .from('defended_challenges')
@@ -158,7 +158,7 @@
             >
               <div class="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <div class="font-semibold text-white">{challenge.model_name}</div>
+                  <div class="font-semibold text-white">{challenge.name || challenge.model_name}</div>
                   <div class="text-xs text-gray-400 mt-1">{challenge.type}</div>
                 </div>
                 <div class="text-xs">

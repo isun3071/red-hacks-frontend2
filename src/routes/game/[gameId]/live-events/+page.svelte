@@ -13,7 +13,7 @@
 
   type TopPlayerRow = {
     userId: string;
-    username: string;
+    displayName: string;
     totalStolen: number;
     successfulAttacks: number;
   };
@@ -53,7 +53,7 @@
       if (!row?.is_successful || !row?.attacker_user_id) continue;
 
       const userId = row.attacker_user_id as string;
-      const username = row.profiles?.username || `User ${userId.slice(0, 8)}`;
+      const displayName = row.profiles?.full_name || row.profiles?.username || `User ${userId.slice(0, 8)}`;
       const stolen = Math.max(0, extractStolenCoins(row.log));
 
       const existing = byUser.get(userId);
@@ -63,7 +63,7 @@
       } else {
         byUser.set(userId, {
           userId,
-          username,
+          displayName,
           totalStolen: stolen,
           successfulAttacks: 1
         });
@@ -79,9 +79,9 @@
     const attackEvents: EventRow[] = (attacks ?? [])
       .filter((row: any) => row?.is_successful)
       .map((row: any) => {
-        const attacker = row.profiles?.username || 'Unknown attacker';
+        const attacker = row.profiles?.full_name || row.profiles?.username || 'Unknown attacker';
         const defenderTeam = row.defended_challenge?.teams?.name || 'Unknown team';
-        const challengeName = row.defended_challenge?.challenges?.model_name || 'Challenge';
+        const challengeName = row.defended_challenge?.challenges?.name || row.defended_challenge?.challenges?.model_name || 'Challenge';
         const stolen = extractStolenCoins(row.log);
 
         return {
@@ -95,7 +95,7 @@
 
     const defenseEvents: EventRow[] = (defenses ?? []).map((row: any) => {
       const teamName = row.teams?.name || 'Unknown team';
-      const challengeName = row.challenges?.model_name || 'Challenge';
+      const challengeName = row.challenges?.name || row.challenges?.model_name || 'Challenge';
 
       return {
         id: `defense-${row.id}`,
@@ -125,7 +125,7 @@
   async function loadAttacksAndTopPlayers() {
     const { data, error } = await supabase
       .from('attacks')
-      .select('id, created_at, is_successful, attacker_user_id, log, profiles!attacks_attacker_user_id_fkey(username), defended_challenge:defended_challenges!inner(id, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(model_name))')
+      .select('id, created_at, is_successful, attacker_user_id, log, profiles!attacks_attacker_user_id_fkey(full_name, username), defended_challenge:defended_challenges!inner(id, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(name, model_name))')
       .eq('defended_challenge.teams.game_id', gameId)
       .order('created_at', { ascending: false })
       .limit(300);
@@ -140,7 +140,7 @@
   async function loadDefenses() {
     const { data, error } = await supabase
       .from('defended_challenges')
-      .select('id, created_at, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(model_name)')
+      .select('id, created_at, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(name, model_name)')
       .eq('teams.game_id', gameId)
       .order('created_at', { ascending: false })
       .limit(300);
@@ -259,7 +259,7 @@
               {#each topPlayers as player, index}
                 <div class="p-4 flex items-center justify-between gap-3">
                   <div>
-                    <p class="text-white font-semibold">#{index + 1} {player.username}</p>
+                    <p class="text-white font-semibold">#{index + 1} {player.displayName}</p>
                     <p class="text-xs text-gray-500 mt-1">Successful attacks: {player.successfulAttacks}</p>
                   </div>
                   <p class="text-red-300 font-bold">{player.totalStolen}</p>

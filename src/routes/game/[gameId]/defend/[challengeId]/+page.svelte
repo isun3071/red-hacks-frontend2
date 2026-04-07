@@ -109,8 +109,8 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
 
     const [{ data: gameChallengeRow, error: challengeError }, { data: defenseRow }, { data: teamRows }, { data: attackRows }, { data: teamRow }] = await Promise.all([
       supabase
-        .from('game_challenges')
-        .select('challenge_id, challenges!inner(id, model_name, description, type, defense_reward_coins, attack_steal_coins)')
+          .from('game_challenges')
+          .select('challenge_id, challenges!inner(id, name, model_name, description, type, defense_reward_coins, attack_steal_coins, default_prompt)')
         .eq('game_id', gameId)
         .eq('challenge_id', challengeId)
         .maybeSingle(),
@@ -145,7 +145,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
     }
 
     defense = defenseRow ?? null;
-    systemPrompt = defense?.system_prompt ?? DEFAULT_DEFENSE_PROMPT;
+    systemPrompt = defense?.system_prompt ?? challenge?.default_prompt ?? DEFAULT_DEFENSE_PROMPT;
 
     if (roundInfo?.type === 'pve') {
       systemPrompt = challenge?.default_prompt ?? DEFAULT_DEFENSE_PROMPT;
@@ -317,7 +317,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
   {:else if challenge}
     <div class="border border-white/10 bg-slate-900/50 rounded-xl p-6 space-y-4">
       <div>
-        <h2 class="text-2xl font-bold text-white">{challenge.model_name}</h2>
+          <h2 class="text-2xl font-bold text-white">{challenge.name || challenge.model_name}</h2>
         <p class="text-sm text-gray-400 mt-1">{challenge.description}</p>
         <p class="text-xs text-gray-500 mt-2">Defense reward: {challenge.defense_reward_coins ?? 0} coins • Attack steal value: {challenge.attack_steal_coins ?? 0} coins</p>
       </div>
@@ -378,7 +378,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
     <div class="border border-white/10 bg-slate-900/50 rounded-xl overflow-hidden">
       <div class="p-4 border-b border-white/10 bg-black/40 flex justify-between items-center">
         <h2 class="text-xs font-bold text-gray-400 tracking-widest uppercase">Previous Attacks Against You</h2>
-        <span class="text-xs text-gray-500">Filtered by {challenge.model_name}</span>
+          <span class="text-xs text-gray-500">Filtered by {challenge.name || challenge.model_name}</span>
       </div>
 
       {#if attacksAgainstUs.length === 0}

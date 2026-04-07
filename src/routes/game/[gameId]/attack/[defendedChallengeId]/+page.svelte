@@ -32,12 +32,19 @@
     userId = userData?.user?.id ?? '';
 
     await loadTarget();
-    loadChatHistory();
+    // Load chat history AFTER roundInfo is available so chatStorageKey is correct
+    if (roundInfo) {
+      loadChatHistory();
+    }
 
     const initialSeed = $page.url.searchParams.get('seed')?.trim();
     if (initialSeed) {
       promptInput = initialSeed;
-      await sendPrompt();
+      try {
+        await sendPrompt();
+      } catch (err: any) {
+        statusError = err?.message || 'Failed to send initial seed prompt';
+      }
       const nextUrl = new URL(window.location.href);
       nextUrl.searchParams.delete('seed');
       window.history.replaceState(window.history.state, '', nextUrl.toString());
@@ -127,6 +134,7 @@
       target = {
         id: data.id,
         team_id: null,
+        system_prompt: data.default_prompt ?? data.context ?? 'You are a helpful assistant.',
         teams: {
           name: roundInfo?.name ?? 'Default Defense',
           game_id: gameId
@@ -190,7 +198,7 @@
 
     const { data, error } = await supabase
       .from('defended_challenges')
-      .select('id, team_id, teams!inner(name, game_id), challenges!inner(*)')
+      .select('id, team_id, system_prompt, teams!inner(name, game_id), challenges!inner(*)')
       .eq('id', defendedChallengeId)
       .eq('teams.game_id', gameId)
       .single();
@@ -246,25 +254,6 @@
     localStorage.setItem(chatStorageKey, JSON.stringify(messages));
   }
 
-  async function parseFunctionError(error: any) {
-    let backendErrorMessage = error?.message || 'Failed to connect to attack server';
-
-    const errorContext = error?.context;
-    if (!errorContext) return backendErrorMessage;
-
-    try {
-      const parsed = await errorContext.json();
-      return parsed?.error || parsed?.message || backendErrorMessage;
-    } catch {
-      try {
-        const rawText = await errorContext.text();
-        return rawText || backendErrorMessage;
-      } catch {
-        return backendErrorMessage;
-      }
-    }
-  }
-
   function toChatMessages() {
     return messages.map((message) => ({
       role: message.role,
@@ -274,6 +263,7 @@
 
   function buildAttackPayload(args: { guess?: string } = {}) {
     const currentAttackMode = resolveRoundType(roundInfo);
+
     const payload: Record<string, unknown> = {
       prompt: messages.length > 0 ? messages[messages.length - 1].content : '',
       guess: args.guess || '',
@@ -281,26 +271,18 @@
     };
 
     if (currentAttackMode === 'pve') {
-      payload.challenge_id = defendedChallengeId;
+      payload.challenge_id = target?.challenges?.id ?? defendedChallengeId;
       payload.game_id = gameId;
       payload.round_type = 'pve';
     } else {
       payload.defended_challenge_id = defendedChallengeId;
+      payload.game_id = gameId;
     }
 
     return payload;
   }
 
-  async function postAttackRequest(url: string, accessToken: string, payload: Record<string, unknown>) {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`
-      },
-      body: JSON.stringify(payload)
-    });
-
+  async function parseAttackResponse(response: Response) {
     const responseText = await response.text();
     let parsed: any = null;
 
@@ -310,12 +292,32 @@
       parsed = responseText;
     }
 
-    if (!response.ok) {
-      const errorMessage = parsed?.error || parsed?.message || responseText || `Attack backend returned ${response.status}`;
-      throw new Error(errorMessage);
+    return { responseText, parsed };
+  }
+
+  async function postAttackRequest(accessToken: string, payload: Record<string, unknown>) {
+    const response = await fetch(`/game/${gameId}/attack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify(payload),
+      mode: 'same-origin'
+    });
+
+    const result = await parseAttackResponse(response);
+
+    if (response.ok) {
+      return result.parsed;
     }
 
-    return parsed;
+    throw new Error(
+      result.parsed?.error ||
+        result.parsed?.message ||
+        result.responseText ||
+        `Attack dispatcher returned ${response.status}`
+    );
   }
 
   async function invokeAttack(args: { guess?: string } = {}) {
@@ -337,47 +339,26 @@
 
     const payload = buildAttackPayload(args);
 
-    let responseData: any = null;
-
     try {
-      if (target.challenges?.challenge_url) {
-        responseData = await postAttackRequest(target.challenges.challenge_url, accessToken, payload);
-      } else {
-        const { data, error } = await supabase.functions.invoke('attack', {
-          headers: {
-            Authorization: `Bearer ${accessToken}`
-          },
-          body: payload
-        });
+      const responseData = await postAttackRequest(accessToken, payload);
+      attackResult = responseData;
 
-        if (error) {
-          const parsedError = await parseFunctionError(error);
-          attackResult = { error: parsedError, success: false };
-          return;
-        }
-
-        responseData = data;
+      if (responseData?.assistant) {
+        messages = [
+          ...messages,
+          {
+            role: 'assistant',
+            content: responseData.assistant,
+            timestamp: new Date().toISOString()
+          }
+        ];
+        persistChatHistory();
       }
     } catch (err: any) {
       attackResult = {
         success: false,
         error: err?.message || 'Unexpected error while connecting to attack backend.'
       };
-      return;
-    }
-
-    attackResult = responseData;
-
-    if (responseData?.assistant) {
-      messages = [
-        ...messages,
-        {
-          role: 'assistant',
-          content: responseData.assistant,
-          timestamp: new Date().toISOString()
-        }
-      ];
-      persistChatHistory();
     }
   }
 
@@ -385,6 +366,7 @@
     if (!promptInput.trim()) return;
 
     loading = true;
+    statusError = '';
 
     try {
       messages = [
@@ -398,6 +380,8 @@
       persistChatHistory();
 
       promptInput = '';
+      
+      // Wait for invokeAttack to fully complete before marking loading as false
       await invokeAttack();
     } catch (err: any) {
       attackResult = {
@@ -446,7 +430,7 @@
     <a href={`/game/${gameId}/attack`} class="inline-flex items-center text-sm text-gray-400 hover:text-white transition-colors mb-4">&larr; Back to Target List</a>
     <h1 class="text-4xl font-black tracking-tight text-white mb-2">Attack Session</h1>
     {#if target}
-      <p class="text-gray-400 text-lg">{attackMode === 'pvp' ? 'Target team' : 'Target challenge'}: <span class="text-red-400 font-semibold">{target.teams?.name || 'Default Defense'}</span> • Challenge: <span class="text-white font-semibold">{target.challenges?.model_name}</span></p>
+      <p class="text-gray-400 text-lg">{attackMode === 'pvp' ? 'Target team' : 'Target challenge'}: <span class="text-red-400 font-semibold">{target.teams?.name || 'Default Defense'}</span> • Challenge: <span class="text-white font-semibold">{target.challenges?.name || target.challenges?.model_name}</span></p>
       {#if roundInfo}
         <p class="text-xs text-gray-500 mt-2">Round: {roundInfo.name} • {roundInfo.type.toUpperCase()}</p>
       {/if}

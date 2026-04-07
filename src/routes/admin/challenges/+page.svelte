@@ -8,6 +8,7 @@
   let interpArgs = $state<any[]>([]);
 
   // Form state
+  let name = $state('');
   let model_name = $state('');
   let description = $state('');
   let default_prompt = $state('');
@@ -46,6 +47,7 @@
   }
 
   function resetForm() {
+    name = '';
     model_name = '';
     description = '';
     default_prompt = '';
@@ -97,6 +99,7 @@
         const { error } = await supabase
           .from('challenges')
           .update({
+            name,
             model_name,
             description,
             default_prompt,
@@ -118,6 +121,7 @@
       } else {
         const { data: user } = await supabase.auth.getUser();
         const newChallenge = {
+          name,
           model_name,
           description,
           default_prompt,
@@ -157,6 +161,7 @@
     editingChallengeId = challenge.id;
     errorMsg = '';
 
+    name = challenge.name ?? '';
     model_name = challenge.model_name ?? '';
     description = challenge.description ?? '';
     default_prompt = challenge.default_prompt ?? '';
@@ -213,6 +218,11 @@
     </div>
     
     <div class="grid grid-cols-2 gap-4">
+      <div class="space-y-2 col-span-2">
+        <p class="text-sm font-medium text-gray-300">Challenge Name</p>
+        <input bind:value={name} placeholder="e.g. Vault Breach, Whisper Trap" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+      </div>
+
       <div class="space-y-2">
         <p class="text-sm font-medium text-gray-300">Model Name</p>
         <input bind:value={model_name} placeholder="e.g. gpt-4o, llama-interp-server" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
@@ -290,7 +300,7 @@
     </div>
 
     <div class="mt-6 flex gap-3">
-      <button onclick={submitChallengeForm} disabled={loading || !model_name || !description} class="flex-1 bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
+      <button onclick={submitChallengeForm} disabled={loading || !name.trim() || !model_name || !description} class="flex-1 bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
         {#if loading}
           {editingChallengeId ? 'Saving...' : 'Creating...'}
         {:else}
@@ -310,7 +320,8 @@
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {#each challenges as challenge}
         <div class="border border-white/10 bg-slate-900/40 backdrop-blur-sm p-5 rounded-xl hover:border-red-500/30 transition-colors shadow-lg">
-          <h3 class="font-bold text-lg text-white">{challenge.model_name}</h3>
+          <h3 class="font-bold text-lg text-white">{challenge.name || challenge.model_name}</h3>
+          <p class="text-xs text-gray-400 mt-1">Model: {challenge.model_name}</p>
           <span class="inline-block px-2.5 py-1 bg-red-500/10 border border-red-500/20 text-xs rounded-full text-red-400 mt-2 font-medium">{challenge.type}</span>
           {#if challenge.challenge_url}
             <p class="mt-2 text-xs text-gray-400 break-all">Backend URL: {challenge.challenge_url}</p>
@@ -326,7 +337,7 @@
               <button onclick={cancelEdit} class="flex-1 border border-white/20 hover:border-white/40 text-white px-3 py-2 rounded-md text-sm font-medium transition-colors">
                 Stop Editing
               </button>
-              <button onclick={submitChallengeForm} disabled={loading || !model_name || !description} class="flex-1 bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white px-3 py-2 rounded-md text-sm font-semibold transition-colors">
+              <button onclick={submitChallengeForm} disabled={loading || !name.trim() || !model_name || !description} class="flex-1 bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white px-3 py-2 rounded-md text-sm font-semibold transition-colors">
                 {loading ? 'Saving...' : 'Save In Form'}
               </button>
             {:else}

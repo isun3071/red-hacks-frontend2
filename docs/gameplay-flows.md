@@ -35,9 +35,27 @@ Flow:
 2. In PvP rounds, load opponent defended challenges in the same game and hide self-team targets and teams with zero coins.
 3. In PvE rounds, load the round's challenges and attack the default prompt defense.
 4. Start attack session with a seed prompt.
-5. If `challenge_url` is set, send the same payload directly to that backend; otherwise send it to the Supabase attack edge function.
+5. Post the attack intent to the same-origin SvelteKit attack dispatcher.
+	- The dispatcher resolves the target challenge server-side, including server-only fields such as `target_secret_key` for secret-key challenges.
+	- If `challenge_url` is set, the dispatcher forwards the resolved payload directly to that backend; otherwise it forwards to the Supabase attack edge function.
 6. The backend enforces rule checks and returns the outcome.
 7. On success, PvP attacks can transfer coins from defender to attacker.
+
+## Custom Backend Route Authoring Notes
+
+If you implement a backend route for `challenge_url`, keep it payload-compatible with the server dispatcher.
+
+Required compatibility:
+- Accept the current attack payload fields (`prompt`, `guess`, `messages`, and target identifiers).
+- Accept the resolved challenge object, including server-only fields such as `target_secret_key` for secret-key challenges.
+- Return JSON that includes at least `success` and a short result message (`output_message` or `message`).
+
+For tool-calling challenges:
+- Evaluate success by inspecting actual model tool calls.
+- Do not rely on model self-judged success flags.
+- Prefer deterministic matching against configured success criteria (tool name + required argument subset).
+
+For full request/response schema details, see the custom backend contract section in `docs/game.md`.
 
 ## Challenge Types
 
