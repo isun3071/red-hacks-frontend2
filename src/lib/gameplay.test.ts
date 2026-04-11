@@ -3,6 +3,7 @@ import {
 	calculateRoundTimeline,
 	getRoundRuntimeContext,
 	isGameActive,
+	isGameJoinable,
 	resolveRoundType,
 	type GameRound,
 	type GameWindow
@@ -117,6 +118,87 @@ describe('isGameActive', () => {
 	})
 })
 
+// ---------- isGameJoinable ----------
+
+describe('isGameJoinable', () => {
+	beforeEach(() => {
+		vi.useFakeTimers()
+	})
+
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it('returns false when is_active is false', () => {
+		vi.setSystemTime(new Date('2026-01-01T06:00:00.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: false,
+				start_time: GAME_START_ISO,
+				end_time: GAME_END_ISO
+			})
+		).toBe(false)
+	})
+
+	it('returns true when active and now is inside the window', () => {
+		vi.setSystemTime(new Date('2026-01-01T06:00:00.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: true,
+				start_time: GAME_START_ISO,
+				end_time: GAME_END_ISO
+			})
+		).toBe(true)
+	})
+
+	it('returns true when now is BEFORE start_time (pre-game joining allowed)', () => {
+		// This is the key difference from isGameActive: pre-game is joinable.
+		vi.setSystemTime(new Date('2025-12-31T12:00:00.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: true,
+				start_time: GAME_START_ISO,
+				end_time: GAME_END_ISO
+			})
+		).toBe(true)
+	})
+
+	it('returns false after end_time (no late joins on finished games)', () => {
+		vi.setSystemTime(new Date('2026-01-01T12:00:01.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: true,
+				start_time: GAME_START_ISO,
+				end_time: GAME_END_ISO
+			})
+		).toBe(false)
+	})
+
+	it('returns false when end_time is not a valid ISO string', () => {
+		vi.setSystemTime(new Date('2026-01-01T06:00:00.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: true,
+				start_time: GAME_START_ISO,
+				end_time: 'not-a-date'
+			})
+		).toBe(false)
+	})
+
+	it('ignores start_time being invalid — only end_time matters for joinability', () => {
+		// Defensive: if only end_time is good, we can still determine whether
+		// the game is finished. start_time parse failures shouldn't block joins.
+		vi.setSystemTime(new Date('2026-01-01T06:00:00.000Z'))
+		expect(
+			isGameJoinable({
+				is_active: true,
+				start_time: 'not-a-date',
+				end_time: GAME_END_ISO
+			})
+		).toBe(true)
+	})
+})
+
 // ---------- calculateRoundTimeline ----------
 
 describe('calculateRoundTimeline', () => {
@@ -190,6 +272,45 @@ describe('calculateRoundTimeline', () => {
 			makeRound({ duration_minutes: 2.9, intermission_minutes: 0 })
 		])
 		expect(entry.endMs - entry.startMs).toBe(2 * MIN)
+	})
+
+	it('omits rounds flagged is_enabled: false from the timeline', () => {
+		const rounds = [
+			makeRound({ round_index: 0, name: 'one', duration_minutes: 5, intermission_minutes: 0, is_enabled: true }),
+			makeRound({ round_index: 1, name: 'two', duration_minutes: 5, intermission_minutes: 0, is_enabled: false }),
+			makeRound({ round_index: 2, name: 'three', duration_minutes: 5, intermission_minutes: 0, is_enabled: true })
+		]
+		const timeline = calculateRoundTimeline(GAME_START_ISO, rounds)
+		expect(timeline.map((entry) => entry.round.name)).toEqual(['one', 'three'])
+	})
+
+	it('disabled rounds do not advance the cursor — enabled rounds are chained adjacently', () => {
+		const rounds = [
+			makeRound({ round_index: 0, name: 'one', duration_minutes: 10, intermission_minutes: 0, is_enabled: true }),
+			makeRound({ round_index: 1, name: 'two', duration_minutes: 99, intermission_minutes: 99, is_enabled: false }),
+			makeRound({ round_index: 2, name: 'three', duration_minutes: 10, intermission_minutes: 0, is_enabled: true })
+		]
+		const timeline = calculateRoundTimeline(GAME_START_ISO, rounds)
+		expect(timeline).toHaveLength(2)
+		// round three starts where round one ended, NOT after round two's
+		// 99-minute window (which is disabled and must not count).
+		expect(timeline[1].startMs).toBe(timeline[0].endMs)
+	})
+
+	it('only excludes is_enabled: false — true, undefined, and null all count as enabled', () => {
+		// Filter is `is_enabled !== false`, so:
+		//   true      → included (explicit opt-in)
+		//   undefined → included (legacy row without the column)
+		//   null      → included (defensive against DB null vs. missing)
+		//   false     → excluded (the only way to disable)
+		const rounds = [
+			makeRound({ round_index: 0, name: 'explicit-true', is_enabled: true }),
+			makeRound({ round_index: 1, name: 'legacy-undef', is_enabled: undefined }),
+			makeRound({ round_index: 2, name: 'null-kept', is_enabled: null }),
+			makeRound({ round_index: 3, name: 'false-dropped', is_enabled: false })
+		]
+		const timeline = calculateRoundTimeline(GAME_START_ISO, rounds)
+		expect(timeline.map((entry) => entry.round.name)).toEqual(['explicit-true', 'legacy-undef', 'null-kept'])
 	})
 })
 
@@ -298,6 +419,23 @@ describe('getRoundRuntimeContext', () => {
 			const ctx = getRoundRuntimeContext(makeGameWindow(), rounds, GAME_START_MS + 30 * MIN)
 			expect(ctx.phase).toBe('post-game')
 			expect(ctx.currentRound).toBeNull()
+			expect(ctx.nextRound).toBeNull()
+		})
+
+		it('disabled middle round is skipped: phase computed as if it did not exist', () => {
+			// Enabled round 0 (0–10 min), disabled round 1 (would be 12–22 min),
+			// enabled round 2 (now slotted at 12–22 min because 1 was skipped).
+			const mixedRounds = [
+				makeRound({ round_index: 0, name: 'one', duration_minutes: 10, intermission_minutes: 2, is_enabled: true }),
+				makeRound({ round_index: 1, name: 'two', duration_minutes: 10, intermission_minutes: 2, is_enabled: false }),
+				makeRound({ round_index: 2, name: 'three', duration_minutes: 10, intermission_minutes: 2, is_enabled: true })
+			]
+			// Sample at +15 min — in the real schedule this would be round 1's
+			// territory, but round 1 is disabled and round 2 (named "three")
+			// has been promoted into that slot.
+			const ctx = getRoundRuntimeContext(makeGameWindow(), mixedRounds, GAME_START_MS + 15 * MIN)
+			expect(ctx.phase).toBe('round-active')
+			expect(ctx.currentRound?.name).toBe('three')
 			expect(ctx.nextRound).toBeNull()
 		})
 	})
