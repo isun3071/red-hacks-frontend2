@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isGameActive } from '$lib/gameplay';
+  import { isGameJoinable } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
@@ -41,8 +41,8 @@
         return;
       }
 
-      if (!isGameActive(gameData)) {
-        actionMessage = 'This game is currently inactive.';
+      if (!isGameJoinable(gameData)) {
+        actionMessage = 'This game is paused or already finished.';
         actionError = true;
         loading = false;
         return;
@@ -75,14 +75,14 @@
 
   async function createTeam() {
     if (!newTeamName || !game) return;
-    if (!isGameActive(game)) {
-      actionMessage = 'This game is currently inactive.';
+    if (!isGameJoinable(game)) {
+      actionMessage = 'This game is paused or already finished.';
       actionError = true;
       return;
     }
     loading = true;
     actionError = false;
-    
+
     const newInviteCode = Math.floor(Math.random()*16777215).toString(16).padStart(6, '0').toUpperCase();
 
     const { data: team, error: teamError } = await supabase
@@ -111,14 +111,14 @@
 
   async function joinTeam() {
     if (!teamInviteCode) return;
-    if (!game || !isGameActive(game)) {
-      actionMessage = 'This game is currently inactive.';
+    if (!game || !isGameJoinable(game)) {
+      actionMessage = 'This game is paused or already finished.';
       actionError = true;
       return;
     }
     loading = true;
     actionError = false;
-    
+
     const { data: team, error: teamError } = await supabase
       .from('teams')
       .select('*')

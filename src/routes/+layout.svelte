@@ -91,9 +91,14 @@ user = session?.user || null;
 await loadProfile(user);
 if (unsubscribed) return;
 
-const listener = supabase.auth.onAuthStateChange(async (_event, nextSession) => {
+// IMPORTANT: do NOT await supabase.from(...) inside this callback. The
+// Supabase JS client holds an internal auth lock for the duration of the
+// callback, and any .from() call needs that same lock — deadlock. Defer
+// the async DB work onto the next task so the handler can return first.
+// https://supabase.com/docs/reference/javascript/auth-onauthstatechange
+const listener = supabase.auth.onAuthStateChange((_event, nextSession) => {
 user = nextSession?.user || null;
-await loadProfile(user);
+setTimeout(() => { void loadProfile(user); }, 0);
 });
 
 authListener = listener.data;
@@ -118,6 +123,9 @@ redirectTo: window.location.origin
 
 async function logout() {
 await supabase.auth.signOut();
+// Gated pages like /profile and /game/* don't watch auth state reactively,
+// so we navigate away on the action that caused the sign-out.
+goto('/');
 }
 </script>
 

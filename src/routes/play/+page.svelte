@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isGameActive } from '$lib/gameplay';
+  import { isGameJoinable } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
@@ -33,8 +33,8 @@
       .eq('invite_code', gameInviteCode.toUpperCase().trim())
       .single();
       
-    if (gameError || !game || !isGameActive(game)) {
-      actionMessage = 'Invalid or inactive game invite code.';
+    if (gameError || !game || !isGameJoinable(game)) {
+      actionMessage = 'Invalid, paused, or already-finished game invite code.';
       actionError = true;
       loading = false;
       return;

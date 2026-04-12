@@ -1,11 +1,18 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
+  import {
+    getRoundRuntimeContext,
+    isGameJoinable,
+    loadRoundChallengeIds,
+    resolveRoundType,
+    type GameRound
+  } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId ?? '');
   let game = $state<any>(null);
+  let cachedRounds = $state<GameRound[]>([]);
   let roundInfo = $state<any>(null);
   let roundPhase = $state('no-rounds');
   let phaseTimeRemaining = $state<number | null>(null);
@@ -76,12 +83,44 @@
     }
 
     game = gameRow;
-    const runtimeContext = await loadRoundRuntimeContext(supabase, gameId);
-    roundInfo = runtimeContext.currentRound;
-    roundPhase = runtimeContext.phase;
-    phaseTimeRemaining = runtimeContext.timeRemainingSeconds;
+
+    const { data: roundsData } = await supabase
+      .from('rounds')
+      .select('game_id, round_index, name, type, required_defenses, available_challenges, duration_minutes, intermission_minutes')
+      .eq('game_id', gameId)
+      .order('round_index', { ascending: true });
+
+    cachedRounds = (roundsData ?? []) as GameRound[];
+    tickRoundContext(); // first paint before the interval effect takes over
+
     await fetchUserData();
     pageLoading = false;
+  });
+
+  function tickRoundContext() {
+    if (!game) return;
+    const ctx = getRoundRuntimeContext(
+      {
+        is_active: Boolean(game.is_active),
+        start_time: game.start_time,
+        end_time: game.end_time
+      },
+      cachedRounds
+    );
+    roundInfo = ctx.currentRound;
+    roundPhase = ctx.phase;
+    phaseTimeRemaining = ctx.timeRemainingSeconds;
+  }
+
+  // Live countdown: recompute the round phase/time every second using the
+  // cached game window + rounds. Pure, no DB hit. Re-runs if `game` or
+  // `cachedRounds` change, and the cleanup clears the previous interval.
+  $effect(() => {
+    if (!game) return;
+    // Read cachedRounds here so Svelte tracks it as a dependency.
+    void cachedRounds;
+    const handle = setInterval(tickRoundContext, 1000);
+    return () => clearInterval(handle);
   });
 
   async function fetchUserData() {
@@ -170,8 +209,8 @@
 
   async function createTeam() {
     if (!newTeamName) return;
-    if (!game || !isGameActive(game)) {
-      actionMessage = 'Team creation is only allowed while this game is active.';
+    if (!game || !isGameJoinable(game)) {
+      actionMessage = 'This game is paused or already finished.';
       actionError = true;
       return;
     }

@@ -9,6 +9,7 @@ export type GameRound = {
 	available_challenges: string[] | null
 	duration_minutes: number | null
 	intermission_minutes: number | null
+	is_enabled?: boolean | null
 }
 
 export type GameWindow = {
@@ -78,13 +79,44 @@ export function isGameActive(gameData: GameWindowLike): boolean {
 	return now >= startMs && now <= endMs
 }
 
+/**
+ * "Can a player join / interact with this game?"
+ *
+ * Looser than `isGameActive`: this returns true for pre-game windows too,
+ * so players can land on the join page, create teams, and pre-configure
+ * defenses before the first round starts. Returns false once the game's
+ * end_time has passed (no late joins on finished games) or the admin has
+ * paused it (is_active = false).
+ *
+ * Use this for JOINING / NAVIGATION gates on player pages.
+ * Use `isGameActive` for runtime ACTION gates (send attack, mutate state)
+ * where "currently inside the window" is the right semantic.
+ */
+export function isGameJoinable(gameData: GameWindowLike): boolean {
+	if (!gameData?.is_active) {
+		return false
+	}
+
+	const endMs = asValidDateMs(gameData.end_time)
+	if (endMs === null) {
+		return false
+	}
+
+	return Date.now() <= endMs
+}
+
 export function calculateRoundTimeline(gameStartIso: string, rounds: GameRound[]): RoundTimelineEntry[] {
 	const gameStartMs = asValidDateMs(gameStartIso)
 	if (gameStartMs === null) {
 		return []
 	}
 
-	const orderedRounds = [...rounds].sort((left, right) => left.round_index - right.round_index)
+	// Skip rounds flagged is_enabled = false. Disabled rounds don't advance
+	// the cursor and aren't visible to players. is_enabled defaults to true
+	// when the column is missing (null/undefined), matching the DB default.
+	const orderedRounds = [...rounds]
+		.filter((round) => round.is_enabled !== false)
+		.sort((left, right) => left.round_index - right.round_index)
 	let cursorMs = gameStartMs
 
 	return orderedRounds.map((round) => {
@@ -242,7 +274,7 @@ export async function loadRoundRuntimeContext(supabase: SupabaseLike, gameId: st
 
 	const { data: roundsData, error: roundsError } = await supabase
 		.from('rounds')
-		.select('game_id, round_index, name, type, required_defenses, available_challenges, duration_minutes, intermission_minutes')
+		.select('game_id, round_index, name, type, required_defenses, available_challenges, duration_minutes, intermission_minutes, is_enabled')
 		.eq('game_id', gameId)
 		.order('round_index', { ascending: true })
 
