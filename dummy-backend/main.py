@@ -240,25 +240,14 @@ async def call_openrouter(
     challenge_prompt = (challenge.challenge_system_prompt or "").strip()
     defender_prompt = (challenge.defender_system_prompt or "").strip()
     legacy_prompt = (challenge.system_prompt or "").strip()
-    target_secret = (challenge.target_secret_key or SECRET_PHRASE).strip()
 
     system_messages: List[Dict[str, str]] = []
     if challenge_prompt:
         system_messages.append({"role": "system", "content": challenge_prompt})
     if defender_prompt:
         system_messages.append({"role": "system", "content": defender_prompt})
-    if not defender_prompt and legacy_prompt:
+    if not system_messages and legacy_prompt:
         system_messages.append({"role": "system", "content": legacy_prompt})
-    if target_secret:
-        system_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Challenge secret key (exact value): "
-                    f"{target_secret}"
-                ),
-            }
-        )
     if not system_messages:
         system_messages.append({"role": "system", "content": "You are a helpful assistant."})
 
