@@ -545,44 +545,6 @@ export const POST: RequestHandler = async ({ params, request }) => {
     const outboundPayload = buildAttackRequestPayload(body, targetDetails, effectiveChallengeId, targetSecretKey);
     const hasDirectBackend = typeof targetDetails?.challenges?.challenge_url === 'string' && targetDetails.challenges.challenge_url.trim().length > 0;
 
-    if (hasDirectBackend && attackerTeamId) {
-      const cooldownTargetColumn = isPveTarget ? 'challenge_id' : 'defended_challenge_id';
-      const cooldownTargetValue = isPveTarget ? effectiveChallengeId : (targetDetails?.id ?? defendedChallengeId);
-
-      const { data: mostRecentAttack, error: mostRecentAttackError } = await supabaseAdmin
-        .from('attacks')
-        .select('created_at')
-        .eq('attacker_team_id', attackerTeamId)
-        .eq(cooldownTargetColumn, cooldownTargetValue)
-        .eq('is_successful', true)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (mostRecentAttackError) {
-        return json({ success: false, error: 'Unable to verify attack cooldown' }, { status: 500 });
-      }
-
-      if (mostRecentAttack?.created_at) {
-        const lastAttackMs = new Date(mostRecentAttack.created_at).getTime();
-
-        if (!Number.isNaN(lastAttackMs)) {
-          const elapsedMs = Date.now() - lastAttackMs;
-
-          if (elapsedMs < ATTACK_COOLDOWN_MS) {
-            const remainingSeconds = Math.ceil((ATTACK_COOLDOWN_MS - elapsedMs) / 1000);
-
-            return json({
-              success: false,
-              message: `Cooldown active for this target. Try again in ${remainingSeconds} seconds.`,
-              cooldown_remaining_seconds: remainingSeconds,
-              log: 'Attack blocked by cooldown policy.'
-            });
-          }
-        }
-      }
-    }
-
     const outboundHeaders: Record<string, string> = {
       'Content-Type': 'application/json'
     };
