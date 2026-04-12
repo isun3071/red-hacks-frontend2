@@ -546,11 +546,12 @@
           <p class="text-xs text-gray-400 mt-1">{target.challenges?.type}</p>
         </div>
         <p class="text-sm text-gray-400">{target.challenges?.description}</p>
-        <div class="text-xs text-gray-500">Steal on success: {target.challenges?.attack_steal_coins ?? 0} coins</div>
+        <div class="text-xs text-gray-500">Base steal value: {target.challenges?.attack_steal_coins ?? 0} coins</div>
         {#if target.challenges?.challenge_url}
           <div class="text-xs text-emerald-300 break-all">Direct backend: {target.challenges.challenge_url}</div>
         {/if}
         <button onclick={clearChatHistory} class="w-full border border-white/20 hover:border-white/40 text-white px-3 py-2 rounded-md text-sm font-medium transition-colors">Clear Chat History</button>
+        <p class="text-[10px] text-gray-600 mt-1">Resets the LLM conversation only. The server still counts all your prior attempts for bonus calculation.</p>
       </div>
 
       <div class="col-span-1 md:col-span-2 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl p-6 space-y-5">
