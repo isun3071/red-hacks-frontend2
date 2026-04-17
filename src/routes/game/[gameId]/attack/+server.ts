@@ -1065,7 +1065,24 @@ export const POST: RequestHandler = async ({ params, request }) => {
       const baseSystemPrompt = (targetDetails?.system_prompt as string | undefined)?.trim()
         || (targetDetails?.challenges?.default_prompt as string | undefined)?.trim()
         || 'You are a helpful assistant.';
+
+      // Inline any uploaded text file contents into the latest user message
+      // (matches the non-judge flow via mergePromptWithAttachments). Without
+      // this, attachments are silently dropped on judge challenges because the
+      // OpenRouter chat-completions endpoint has no file-attachment primitive
+      // — text tokens are all these models see regardless of their modality.
       const chatMessages = normalizeMessages(body.messages);
+      const attachmentSummaries = normalizeAttachmentSummaries(body.attachments);
+      if (attachmentSummaries.length > 0 && chatMessages.length > 0) {
+        const lastIdx = chatMessages.length - 1;
+        const lastMessage = chatMessages[lastIdx];
+        if (lastMessage.role === 'user') {
+          chatMessages[lastIdx] = {
+            ...lastMessage,
+            content: mergePromptWithAttachments(lastMessage.content, attachmentSummaries)
+          };
+        }
+      }
       const systemMessage = { role: 'system' as const, content: baseSystemPrompt };
 
       try {
