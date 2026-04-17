@@ -24,5 +24,10 @@
       <h2 class="text-xl font-bold group-hover:text-red-400 transition-colors">Manage Interp Args &rarr;</h2>
       <p class="text-gray-400 mt-2 leading-relaxed">Create and manage interpretation arguments and configurations for specialized models like llama-interp-server.</p>
     </a>
+
+    <a href="/admin/escalations" class="p-6 border border-amber-500/30 bg-amber-500/5 backdrop-blur-sm rounded-xl hover:bg-amber-500/10 hover:border-amber-500/50 hover:shadow-lg hover:shadow-amber-500/10 transition-all group">
+      <h2 class="text-xl font-bold group-hover:text-amber-400 transition-colors">Review Escalations &rarr;</h2>
+      <p class="text-gray-400 mt-2 leading-relaxed">Resolve judge-type attack escalations where the LLM judge couldn't form a confident verdict. Coins are held in escrow pending your decision.</p>
+    </a>
   </div>
 </div>
