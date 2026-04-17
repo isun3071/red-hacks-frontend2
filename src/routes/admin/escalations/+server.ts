@@ -89,9 +89,9 @@ export const POST: RequestHandler = async ({ request }) => {
 			coefficient
 		});
 
-		// Find the defender team id. We need it to refund.
-		// If this was a PvP attack, defended_challenge_id points to a
-		// defended_challenges row whose team_id is the defender.
+		// Find the defender team id. PvP attacks have a defended_challenge_id
+		// whose team_id is the defender. PvE attacks have none — no defender,
+		// so the attacker is paid directly from the system (escrow is zero).
 		let defenderTeamId: string | null = null;
 		if (attackRow.defended_challenge_id) {
 			const { data: dc } = await supabaseAdmin
@@ -102,17 +102,29 @@ export const POST: RequestHandler = async ({ request }) => {
 			defenderTeamId = dc?.team_id ?? null;
 		}
 
-		if (!defenderTeamId || !attackRow.attacker_team_id) {
-			return json({ success: false, error: 'Missing team references on the attack row' }, { status: 500 });
+		if (!attackRow.attacker_team_id) {
+			return json({ success: false, error: 'Missing attacker team reference' }, { status: 500 });
 		}
 
-		// Settle coins: attacker gets min(ruled_payout, escrow). Defender
-		// gets back the remainder.
-		const attackerPayout = Math.min(reward.total, escrow);
-		const defenderRefund = escrow - attackerPayout;
+		const isPveEscalation = attackRow.defended_challenge_id === null;
+		if (!isPveEscalation && !defenderTeamId) {
+			return json({ success: false, error: 'Missing defender team reference' }, { status: 500 });
+		}
 
+		let attackerPayout = 0;
+		let defenderRefund = 0;
 		let attackerCoinsAfter: number | null = null;
 		let defenderCoinsAfter: number | null = null;
+
+		if (isPveEscalation) {
+			// No escrow was held. Pay the attacker the full ruled reward.
+			attackerPayout = reward.total;
+		} else {
+			// PvP: attacker gets min(ruled_payout, escrow). Defender gets back
+			// the remainder so they're not double-charged beyond the ruling.
+			attackerPayout = Math.min(reward.total, escrow);
+			defenderRefund = escrow - attackerPayout;
+		}
 
 		if (attackerPayout > 0) {
 			const { data: newAtt } = await supabaseAdmin.rpc('increment_team_coins', {
@@ -122,7 +134,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			if (typeof newAtt === 'number') attackerCoinsAfter = newAtt;
 		}
 
-		if (defenderRefund > 0) {
+		if (defenderRefund > 0 && defenderTeamId) {
 			const { data: newDef } = await supabaseAdmin.rpc('increment_team_coins', {
 				p_team_id: defenderTeamId,
 				p_delta: defenderRefund

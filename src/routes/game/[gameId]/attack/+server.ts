@@ -319,13 +319,30 @@ function resolveChallengeTools(challenge: any) {
     .filter((tool: any) => !!tool);
 }
 
+/**
+ * Build the actual system prompt sent to the target LLM. The challenge's
+ * admin-set `context` is prepended to the defender's saved prompt so the
+ * model is grounded in the secrets/instructions the admin specified, while
+ * the defender's layer adds team-specific hardening. Defenders never see
+ * `context` (it's filtered out of their defense-page query), so they're
+ * protecting material they don't know about — the whole point of the setup.
+ */
+function composeSystemPrompt(context: string | null | undefined, defender: string | null | undefined, fallback: string | null | undefined): string {
+  const ctx = (context ?? '').trim();
+  const def = (defender ?? '').trim();
+  const fb = (fallback ?? '').trim();
+  const defenderLayer = def || fb;
+  if (ctx && defenderLayer) return `${ctx}\n\n${defenderLayer}`;
+  return ctx || defenderLayer || 'You are a helpful assistant.';
+}
+
 function buildResolvedChallengePayload(targetDetails: any, challengeId: string, targetSecretKey: string | null) {
   const challenges = targetDetails?.challenges ?? {};
-  const challengeSystemPrompt =
-    (challenges?.default_prompt as string | undefined)?.trim() ||
-    (challenges?.context as string | undefined)?.trim() ||
-    'You are a helpful assistant.';
+  const challengeContext = typeof challenges?.context === 'string' ? challenges.context : null;
+  const challengeDefaultPrompt = typeof challenges?.default_prompt === 'string' ? challenges.default_prompt : null;
   const defenderSystemPrompt = (targetDetails?.system_prompt as string | undefined)?.trim() || null;
+
+  const systemPrompt = composeSystemPrompt(challengeContext, defenderSystemPrompt, challengeDefaultPrompt);
 
   return {
     challenge_id: challengeId,
@@ -333,9 +350,9 @@ function buildResolvedChallengePayload(targetDetails: any, challengeId: string, 
     title: challenges?.model_name ?? 'Challenge',
     description: challenges?.description ?? '',
     objective: parseChallengeObjective(challenges),
-    challenge_system_prompt: challengeSystemPrompt,
+    challenge_system_prompt: challengeDefaultPrompt || challengeContext || 'You are a helpful assistant.',
     defender_system_prompt: defenderSystemPrompt,
-    system_prompt: defenderSystemPrompt || challengeSystemPrompt,
+    system_prompt: systemPrompt,
     success_tool_name: challenges?.target_tool_name ?? null,
     success_tool_args: challenges?.target_tool_args ?? null,
     interp_args: challenges?.interp_args ?? null,
@@ -795,17 +812,23 @@ export const POST: RequestHandler = async ({ params, request }) => {
         return json({ success: false, error: 'End Attack is only supported on judge-type challenges.' }, { status: 400 });
       }
 
-      if (isPveTarget) {
-        return json({ success: false, error: 'Judge challenges in PvE mode are not yet supported.' }, { status: 400 });
-      }
-
-      if (!attackerTeamId || !targetDetails?.team_id) {
+      if (!attackerTeamId) {
         return json({ success: false, error: 'Missing team context for judge settlement.' }, { status: 400 });
+      }
+      if (!isPveTarget && !targetDetails?.team_id) {
+        return json({ success: false, error: 'Missing defender team context.' }, { status: 400 });
       }
 
       const rubric = (targetDetails?.challenges?.judge_rubric ?? null) as JudgeRubric | null;
       const judgeModel = typeof targetDetails?.challenges?.judge_model === 'string' ? targetDetails.challenges.judge_model : null;
-      const defenderSystemPrompt = typeof targetDetails?.system_prompt === 'string' ? targetDetails.system_prompt : null;
+      // The judge must see the FULL system prompt (admin context + defender
+      // layer) so it knows what's protected. Defenders write blind on top of
+      // the admin-supplied context.
+      const defenderSystemPrompt = composeSystemPrompt(
+        targetDetails?.challenges?.context,
+        typeof targetDetails?.system_prompt === 'string' ? targetDetails.system_prompt : null,
+        targetDetails?.challenges?.default_prompt
+      );
       const transcript = normalizeMessages(body.messages).map((m) => ({ role: m.role, content: m.content }));
 
       const judgeResult = await callJudgeLlm({
@@ -819,28 +842,36 @@ export const POST: RequestHandler = async ({ params, request }) => {
       const challengeStealCoins = Math.max(0, Math.trunc(targetDetails?.challenges?.attack_steal_coins ?? 0));
       const challengeDefenseReward = Math.max(0, Math.trunc(targetDetails?.challenges?.defense_reward_coins ?? 0));
 
+      // Windowing: PvE keys on challenge_id (shared challenge, no per-team
+      // defense row). PvP keys on defended_challenge_id as before.
+      const windowColumn: 'challenge_id' | 'defended_challenge_id' =
+        isPveTarget ? 'challenge_id' : 'defended_challenge_id';
+      const windowValue = isPveTarget ? effectiveChallengeId : targetDetails.id;
+
       // Count all per-turn attempts this team has logged against this target
-      // since the last successful attack / defender prompt update / now. This
-      // is the server-authoritative turn count — it includes turns the user
-      // cleared on the client via Clear Chat, so clearing doesn't game the bonus.
+      // since the last successful attack / defender prompt update. Includes
+      // turns the user cleared client-side via Clear Chat so clearing doesn't
+      // game the bonus.
       const { data: lastSuccess } = await supabaseAdmin
         .from('attacks')
         .select('created_at')
         .eq('attacker_team_id', attackerTeamId)
-        .eq('defended_challenge_id', targetDetails.id)
+        .eq(windowColumn, windowValue)
         .eq('is_successful', true)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       const lastSuccessMs = lastSuccess?.created_at ? new Date(lastSuccess.created_at).getTime() : 0;
-      const updatedAtMs = targetDetails?.updated_at ? new Date(targetDetails.updated_at).getTime() : 0;
+      const updatedAtMs = !isPveTarget && targetDetails?.updated_at
+        ? new Date(targetDetails.updated_at).getTime()
+        : 0;
       const windowStartIso = new Date(Math.max(lastSuccessMs, updatedAtMs)).toISOString();
 
       const { data: priorTurns } = await supabaseAdmin
         .from('attacks')
         .select('log')
         .eq('attacker_team_id', attackerTeamId)
-        .eq('defended_challenge_id', targetDetails.id)
+        .eq(windowColumn, windowValue)
         .eq('is_successful', false)
         .gt('created_at', windowStartIso);
 
@@ -873,22 +904,30 @@ export const POST: RequestHandler = async ({ params, request }) => {
         coefficient: 1
       });
 
-      // Escalate path (judge failed or explicitly escalated): hold escrow from defender, no payout yet.
+      // Escalate path: PvP holds escrow from defender so the attacker is
+      // guaranteed the ruled payout even if the defender is drained later.
+      // PvE has no defender, so no escrow is held — admin ruling pays
+      // directly from the system when it lands.
       if (!judgeResult.ok || judgeResult.verdict === 'escalate') {
-        const escalateReason = judgeResult.ok ? judgeResult.reason : judgeResult.reason;
-        const heldAmount = Math.min(targetDetails.teams?.coins ?? 0, maxPotential.total);
+        const escalateReason = judgeResult.reason;
 
-        let defenderCoinsAfter: number | null = targetDetails.teams?.coins ?? null;
+        let heldAmount = 0;
+        let defenderCoinsAfter: number | null = null;
         let defenderEliminated = false;
-        if (heldAmount > 0) {
-          const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -heldAmount);
-          if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
-          if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
-            defenderEliminated = true;
-            await supabaseAdmin
-              .from('defended_challenges')
-              .update({ is_active: false })
-              .eq('team_id', targetDetails.team_id);
+
+        if (!isPveTarget) {
+          heldAmount = Math.min(targetDetails.teams?.coins ?? 0, maxPotential.total);
+          defenderCoinsAfter = targetDetails.teams?.coins ?? null;
+          if (heldAmount > 0) {
+            const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -heldAmount);
+            if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
+            if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
+              defenderEliminated = true;
+              await supabaseAdmin
+                .from('defended_challenges')
+                .update({ is_active: false })
+                .eq('team_id', targetDetails.team_id);
+            }
           }
         }
 
@@ -902,13 +941,14 @@ export const POST: RequestHandler = async ({ params, request }) => {
           max_potential_total: maxPotential.total,
           transcript_length: transcript.length,
           defender_coins_after: defenderCoinsAfter,
-          defender_eliminated: defenderEliminated
+          defender_eliminated: defenderEliminated,
+          mode: isPveTarget ? 'pve' : 'pvp'
         };
 
         const { data: inserted } = await supabaseAdmin
           .from('attacks')
           .insert({
-            defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+            defended_challenge_id: isPveTarget ? null : (targetDetails?.id ?? defendedChallengeId),
             challenge_id: effectiveChallengeId,
             attacker_user_id: attackerUserId,
             attacker_team_id: attackerTeamId,
@@ -928,7 +968,9 @@ export const POST: RequestHandler = async ({ params, request }) => {
           success: false,
           attack_id: inserted?.id ?? null,
           escalated: true,
-          message: 'Attack submitted for admin review. Coins held in escrow pending decision.',
+          message: isPveTarget
+            ? 'Attack submitted for admin review. Payout will be credited when the admin issues a verdict.'
+            : 'Attack submitted for admin review. Coins held in escrow pending decision.',
           escrow_amount: heldAmount,
           max_potential_total: maxPotential.total,
           judge_reason: escalateReason
@@ -945,25 +987,34 @@ export const POST: RequestHandler = async ({ params, request }) => {
         coefficient
       });
 
-      let defenderCoinsAfter: number | null = targetDetails.teams?.coins ?? null;
+      let defenderCoinsAfter: number | null = isPveTarget ? null : (targetDetails.teams?.coins ?? null);
       let attackerCoinsAfter: number | null = null;
       let defenderEliminated = false;
-      const totalTransfer = Math.min(targetDetails.teams?.coins ?? 0, reward.total);
+      let totalTransfer = 0;
 
-      if (totalTransfer > 0) {
-        // Zero-sum: subtract from defender, add to attacker.
-        const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -totalTransfer);
-        if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
-        if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
-          defenderEliminated = true;
-          await supabaseAdmin
-            .from('defended_challenges')
-            .update({ is_active: false })
-            .eq('team_id', targetDetails.team_id);
+      if (reward.total > 0) {
+        if (isPveTarget) {
+          // PvE: no defender, credit the attacker from the system.
+          totalTransfer = reward.total;
+          const newAttackerBalance = await incrementTeamCoins(supabaseAdmin, attackerTeamId, totalTransfer);
+          if (typeof newAttackerBalance === 'number') attackerCoinsAfter = newAttackerBalance;
+        } else {
+          // PvP zero-sum: attacker's gain is capped by defender's balance.
+          totalTransfer = Math.min(targetDetails.teams?.coins ?? 0, reward.total);
+          if (totalTransfer > 0) {
+            const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -totalTransfer);
+            if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
+            if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
+              defenderEliminated = true;
+              await supabaseAdmin
+                .from('defended_challenges')
+                .update({ is_active: false })
+                .eq('team_id', targetDetails.team_id);
+            }
+            const newAttackerBalance = await incrementTeamCoins(supabaseAdmin, attackerTeamId, totalTransfer);
+            if (typeof newAttackerBalance === 'number') attackerCoinsAfter = newAttackerBalance;
+          }
         }
-
-        const newAttackerBalance = await incrementTeamCoins(supabaseAdmin, attackerTeamId, totalTransfer);
-        if (typeof newAttackerBalance === 'number') attackerCoinsAfter = newAttackerBalance;
       }
 
       const attackLog = {
@@ -982,20 +1033,20 @@ export const POST: RequestHandler = async ({ params, request }) => {
         char_count: userCharCount,
         defender_coins_after: defenderCoinsAfter,
         attacker_coins_after: attackerCoinsAfter,
-        defender_eliminated: defenderEliminated
+        defender_eliminated: defenderEliminated,
+        mode: isPveTarget ? 'pve' : 'pvp'
       };
 
       // Every real verdict is a terminal "attempt concluded" event. Marking
       // is_successful=true advances the bonus window (see refreshServerTurnCount
       // and computeEleganceBonus) so the attacker's next attempt on this
-      // defender starts fresh. 'none' gets this too — the attacker is entitled
-      // to a clean slate after the judge rules, even without a payout. The
-      // "already compromised" re-attack block keys off judge_verdict='full', so
-      // flipping is_successful on non-full verdicts doesn't lock them out.
+      // target starts fresh. The "already compromised" re-attack block keys
+      // off judge_verdict='full', so flipping is_successful on non-full
+      // verdicts doesn't lock them out.
       const { data: insertedVerdictRow } = await supabaseAdmin
         .from('attacks')
         .insert({
-          defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+          defended_challenge_id: isPveTarget ? null : (targetDetails?.id ?? defendedChallengeId),
           challenge_id: effectiveChallengeId,
           attacker_user_id: attackerUserId,
           attacker_team_id: attackerTeamId,
@@ -1062,10 +1113,32 @@ export const POST: RequestHandler = async ({ params, request }) => {
       }
 
       const modelName = targetDetails?.challenges?.model_name || 'openai/gpt-4o-mini';
-      const baseSystemPrompt = (targetDetails?.system_prompt as string | undefined)?.trim()
-        || (targetDetails?.challenges?.default_prompt as string | undefined)?.trim()
-        || 'You are a helpful assistant.';
+      // Prepend admin's System Context so the target LLM actually has the
+      // secrets the judge expects it to protect. Defenders never see this
+      // context; they add their protective layer on top.
+      const baseSystemPrompt = composeSystemPrompt(
+        targetDetails?.challenges?.context,
+        targetDetails?.system_prompt,
+        targetDetails?.challenges?.default_prompt
+      );
+
+      // Inline any uploaded text file contents into the latest user message
+      // (matches the non-judge flow via mergePromptWithAttachments). Without
+      // this, attachments are silently dropped on judge challenges because the
+      // OpenRouter chat-completions endpoint has no file-attachment primitive
+      // — text tokens are all these models see regardless of their modality.
       const chatMessages = normalizeMessages(body.messages);
+      const attachmentSummaries = normalizeAttachmentSummaries(body.attachments);
+      if (attachmentSummaries.length > 0 && chatMessages.length > 0) {
+        const lastIdx = chatMessages.length - 1;
+        const lastMessage = chatMessages[lastIdx];
+        if (lastMessage.role === 'user') {
+          chatMessages[lastIdx] = {
+            ...lastMessage,
+            content: mergePromptWithAttachments(lastMessage.content, attachmentSummaries)
+          };
+        }
+      }
       const systemMessage = { role: 'system' as const, content: baseSystemPrompt };
 
       try {
@@ -1097,10 +1170,13 @@ export const POST: RequestHandler = async ({ params, request }) => {
         // for bonus calc. Without this, Clear Chat "resets" turn counts on the
         // server because there's no record of prior judge-type prompts.
         // The End Attack handler later queries these rows via computeEleganceBonus.
-        if (attackerTeamId && targetDetails?.id) {
+        // PvE rows use challenge_id only; targetDetails.id is the challenge_id
+        // there, not a defended_challenges row, so writing it to
+        // defended_challenge_id would fail the FK.
+        if (attackerTeamId && effectiveChallengeId) {
           const latestPrompt = body.prompt?.trim() || chatMessages.at(-1)?.content || '';
           await supabaseAdmin.from('attacks').insert({
-            defended_challenge_id: targetDetails.id,
+            defended_challenge_id: isPveTarget ? null : (targetDetails?.id ?? null),
             challenge_id: effectiveChallengeId,
             attacker_user_id: attackerUserId,
             attacker_team_id: attackerTeamId,
@@ -1109,7 +1185,8 @@ export const POST: RequestHandler = async ({ params, request }) => {
               source: 'judge-per-turn',
               latest_prompt: latestPrompt,
               assistant_message: String(assistantContent),
-              model_name: modelName
+              model_name: modelName,
+              mode: isPveTarget ? 'pve' : 'pvp'
             }
           });
         }
