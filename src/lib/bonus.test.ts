@@ -231,3 +231,81 @@ describe('exported tuning constants', () => {
 		expect(SOFT_CHAR_CAP).toBe(4000)
 	})
 })
+
+// ---------- judge coefficient ----------
+
+describe('calculateAttackBonus — judge coefficient', () => {
+	it('defaults coefficient to 1.0 when not provided (backwards compat)', () => {
+		const withoutCoef = calculateAttackBonus(makeInput())
+		const withCoef = calculateAttackBonus(makeInput({ coefficient: 1 }))
+		expect(withoutCoef).toEqual(withCoef)
+	})
+
+	it('coefficient 0 zeroes out both base and bonus — clean "none" verdict', () => {
+		const result = calculateAttackBonus(makeInput({ coefficient: 0 }))
+		expect(result.base).toBe(0)
+		expect(result.maxBonus).toBe(0)
+		expect(result.bonus).toBe(0)
+		expect(result.total).toBe(0)
+	})
+
+	it('coefficient 0.5 halves the base and the bonus ceiling (bonus tracks base)', () => {
+		// steal=40, reward=100, 4 turns: elegance = 1 - 3/10 = 0.7
+		const result = calculateAttackBonus(
+			makeInput({ attackStealCoins: 40, defenseRewardCoins: 100, turnCount: 4, coefficient: 0.5 })
+		)
+		expect(result.base).toBe(20)
+		// maxBonus = min(100, 3*20) = 60, bonus = floor(60 * 0.7) = 42
+		expect(result.maxBonus).toBe(60)
+		expect(result.bonus).toBe(42)
+		expect(result.total).toBe(62)
+	})
+
+	it('coefficient 1.0 matches the full-coefficient math', () => {
+		const result = calculateAttackBonus(
+			makeInput({ attackStealCoins: 40, defenseRewardCoins: 100, turnCount: 4, coefficient: 1 })
+		)
+		expect(result.base).toBe(40)
+		expect(result.maxBonus).toBe(100)
+		// bonus = floor(100 * 0.7) = 70 (fp: actually 69 — 100 * 0.7 = 69.9999... in JS)
+		expect(result.bonus).toBeGreaterThanOrEqual(69)
+		expect(result.bonus).toBeLessThanOrEqual(70)
+		expect(result.total).toBe(result.base + result.bonus)
+	})
+
+	it('walks the 5-tier spectrum with monotonically increasing totals', () => {
+		const tiers = [0, 0.25, 0.5, 0.75, 1.0]
+		const results = tiers.map((c) =>
+			calculateAttackBonus(
+				makeInput({ attackStealCoins: 40, defenseRewardCoins: 100, turnCount: 4, coefficient: c })
+			)
+		)
+		for (let i = 1; i < results.length; i += 1) {
+			expect(results[i].total).toBeGreaterThanOrEqual(results[i - 1].total)
+		}
+		// And the endpoints are as expected
+		expect(results[0].total).toBe(0)
+		expect(results[results.length - 1].total).toBe(results[results.length - 1].base + results[results.length - 1].bonus)
+	})
+
+	it('clamps coefficient < 0 to 0', () => {
+		const result = calculateAttackBonus(makeInput({ coefficient: -2 }))
+		expect(result.coefficient).toBe(0)
+		expect(result.total).toBe(0)
+	})
+
+	it('clamps coefficient > 1 to 1', () => {
+		const result = calculateAttackBonus(makeInput({ coefficient: 99 }))
+		expect(result.coefficient).toBe(1)
+	})
+
+	it('NaN coefficient falls back to 1.0', () => {
+		const result = calculateAttackBonus(makeInput({ coefficient: NaN }))
+		expect(result.coefficient).toBe(1)
+	})
+
+	it('echoes the clamped coefficient back in the result', () => {
+		const r = calculateAttackBonus(makeInput({ coefficient: 0.5 }))
+		expect(r.coefficient).toBe(0.5)
+	})
+})

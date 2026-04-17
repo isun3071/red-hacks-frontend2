@@ -53,24 +53,23 @@
   const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
   let selectedTarget = $derived(challenges.find((c: any) => c.id === selectedChallengeId) ?? null);
+  let selectedTargetCompromised = $derived(selectedTarget?.compromised_by_me === true);
   let chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${selectedChallengeId}`);
 
+  // Reward preview is fully server-driven. We never use the local messages
+  // array for turn/char counting — that's what Clear Chat empties. The server
+  // logs every attempt (including judge per-turn prompts) to the attacks table,
+  // and `refreshServerTurnCount` below reads that count. The only client-side
+  // input is the draft prompt the user is currently typing — that's the
+  // "+1 turn" we're previewing.
   let potentialReward = $derived.by(() => {
-    const userMessages = messages.filter((m) => m.role === 'user');
-    const localTurns = userMessages.length;
-    const localChars = userMessages.reduce((acc, m) => acc + m.content.length, 0);
     const draftChars = promptInput.length;
-
-    // After a chat clear, serverTurnCount is populated from the attacks table
-    // so the preview reflects ALL prior attempts, not just the (now empty)
-    // local messages. Use whichever is higher (server may know about attempts
-    // the client doesn't have in localStorage).
-    const effectiveTurns = Math.max(localTurns, serverTurnCount ?? 0);
-    const effectiveChars = Math.max(localChars, serverCharCount ?? 0);
+    const priorTurns = serverTurnCount ?? 0;
+    const priorChars = serverCharCount ?? 0;
 
     return calculateAttackBonus({
-      turnCount: effectiveTurns + 1,
-      charCount: effectiveChars + draftChars,
+      turnCount: priorTurns + 1,
+      charCount: priorChars + draftChars,
       attackStealCoins: selectedTarget?.challenges?.attack_steal_coins ?? 0,
       defenseRewardCoins: selectedTarget?.challenges?.defense_reward_coins ?? 0
     });
@@ -198,19 +197,55 @@
 
     try {
       const targetColumn = attackMode === 'pve' ? 'challenge_id' : 'defended_challenge_id';
+      const teamId = await getMyTeamId();
+      if (!teamId) {
+        serverTurnCount = 0;
+        serverCharCount = 0;
+        return;
+      }
+
+      // Mirror the server-side windowing from computeEleganceBonus:
+      // turn count = failed attempts with created_at > max(last_success, updated_at).
+      // Without this, a successful attack leaves phantom failed-turn history
+      // from the pre-success window haunting the next attack's preview.
+
+      // 1. Last successful attack against this target by this team
+      const { data: lastSuccessRows } = await supabase
+        .from('attacks')
+        .select('created_at')
+        .eq('attacker_team_id', teamId)
+        .eq(targetColumn, selectedChallengeId)
+        .eq('is_successful', true)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      const lastSuccessIso = lastSuccessRows?.[0]?.created_at ?? null;
+
+      // 2. Defender's last prompt-update (PvP only — resets window when defender
+      //    rewrites their system_prompt, same as server logic).
+      let defenderUpdatedAtIso: string | null = null;
+      if (attackMode !== 'pve') {
+        const { data: defenderRow } = await supabase
+          .from('defended_challenges')
+          .select('updated_at')
+          .eq('id', selectedChallengeId)
+          .maybeSingle();
+        defenderUpdatedAtIso = (defenderRow as any)?.updated_at ?? null;
+      }
+
+      const lastSuccessMs = lastSuccessIso ? new Date(lastSuccessIso).getTime() : 0;
+      const defenderUpdatedMs = defenderUpdatedAtIso ? new Date(defenderUpdatedAtIso).getTime() : 0;
+      const windowStartIso = new Date(Math.max(lastSuccessMs, defenderUpdatedMs)).toISOString();
+
+      // 3. Count failed attempts after the window start
       const { data } = await supabase
         .from('attacks')
-        .select('is_successful, log, created_at')
-        .eq('attacker_team_id', await getMyTeamId())
+        .select('log, created_at')
+        .eq('attacker_team_id', teamId)
         .eq(targetColumn, selectedChallengeId)
         .eq('is_successful', false)
-        .order('created_at', { ascending: false });
+        .gt('created_at', windowStartIso);
 
-      // Count all failed attempts (the server uses a time window, but for a
-      // quick preview after clear we just use the total — it'll be close
-      // enough and always >= the server's count, so the preview is
-      // conservative rather than misleading).
-      serverTurnCount = (data?.length ?? 0);
+      serverTurnCount = data?.length ?? 0;
       serverCharCount = (data ?? []).reduce((acc, row: any) => {
         const prompt = row?.log?.latest_prompt;
         return acc + (typeof prompt === 'string' ? prompt.length : 0);
@@ -232,7 +267,8 @@
     return data?.team_id ?? '';
   }
 
-  // When the selected target changes, swap the chat and reset server counts
+  // When the selected target changes, swap the chat and fetch the server-side
+  // turn count so the preview is accurate from the moment the user picks a target.
   $effect(() => {
     if (selectedChallengeId) {
       loadChatForTarget();
@@ -242,6 +278,8 @@
       clearAttachments();
       serverTurnCount = null;
       serverCharCount = null;
+      // Fire-and-forget: populates serverTurnCount in the background.
+      void refreshServerTurnCount();
     }
   });
 
@@ -342,6 +380,25 @@
       messages = [...messages, { role: 'assistant', content: responseData.assistant, timestamp: new Date().toISOString() }];
       persistChat();
     }
+
+    // Always refresh the server-side turn count after any attack invocation.
+    // The /attack call inserted a row (success or failure) that shifts our
+    // windowStart, so the preview must re-query to stay accurate. This is
+    // the single source of truth — all callers (sendPrompt, submitSecretGuess,
+    // endAttack, whatever) inherit it by going through invokeAttack.
+    void refreshServerTurnCount();
+
+    // If this attack fully compromised the target, mark it locally so the
+    // target entry is flagged "compromised" and the action buttons disable.
+    // Non-judge: success=true. Judge: verdict='full'.
+    const compromised =
+      responseData?.verdict === 'full' ||
+      (responseData?.success === true && responseData?.verdict === undefined);
+    if (compromised && selectedChallengeId) {
+      challenges = challenges.map((c: any) =>
+        c.id === selectedChallengeId ? { ...c, compromised_by_me: true } : c
+      );
+    }
   }
 
   async function sendPrompt() {
@@ -352,6 +409,9 @@
       persistChat();
       promptInput = '';
       await invokeAttack();
+      // Refresh server-side count so the preview stays correct even if the
+      // user clears chat later (server persists turns across local clears).
+      void refreshServerTurnCount();
     } catch (err: any) {
       attackResult = { success: false, error: err?.message || 'Unexpected error while sending prompt.' };
     } finally {
@@ -365,8 +425,74 @@
     try {
       await invokeAttack({ guess: secretKeyGuess.trim() });
       secretKeyGuess = '';
+      // Same rationale as sendPrompt: a successful guess writes an is_successful=true
+      // row that shifts the windowStart, so we need to re-query.
+      void refreshServerTurnCount();
     } catch (err: any) {
       attackResult = { success: false, error: err?.message || 'Unexpected error while submitting secret key guess.' };
+    } finally {
+      chatLoading = false;
+    }
+  }
+
+  /**
+   * Judge-type challenges: commit the current transcript to the judge
+   * LLM. Server returns a tier verdict (coefficient settles coins) or an
+   * escalate (coins go into escrow pending admin review).
+   */
+  async function endAttack() {
+    if (!selectedTarget || !userId) return;
+    if (selectedTarget?.challenges?.type !== 'judge') return;
+
+    const userTurnCount = messages.filter((m) => m.role === 'user').length;
+    if (userTurnCount === 0) {
+      attackResult = { success: false, error: 'Send at least one prompt before ending the attack.' };
+      return;
+    }
+
+    if (!confirm('End this attack and submit to the judge?\n\nThe judge LLM will evaluate your full transcript against the challenge rubric and assign a tier (none / structural / partial / substantial / full). Coins will settle based on the verdict. If the judge cannot form a confident verdict, coins go into escrow for admin review.\n\nYou cannot undo this.')) {
+      return;
+    }
+
+    chatLoading = true;
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        attackResult = { success: false, error: 'Your session expired. Sign in again.' };
+        return;
+      }
+
+      const payload = {
+        ...buildAttackPayload(),
+        end_attack: true
+      };
+
+      const response = await fetch(`/game/${gameId}/attack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify(payload)
+      });
+      const text = await response.text();
+      let data: any = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+
+      if (!response.ok && !data) {
+        attackResult = { success: false, error: `End Attack failed: ${response.status}` };
+        return;
+      }
+
+      attackResult = data;
+
+      // Clear local chat after settlement so the next attempt starts fresh
+      // (server has persisted the verdict). Skip clear if escalated so the
+      // attacker can review what they submitted.
+      if (data?.escalated !== true) {
+        messages = [];
+        if (chatStorageKey) localStorage.removeItem(chatStorageKey);
+      }
+    } catch (err: any) {
+      attackResult = { success: false, error: err?.message || 'Unexpected error ending attack.' };
     } finally {
       chatLoading = false;
     }
@@ -446,7 +572,29 @@
           .gt('teams.coins', 0)
           .neq('team_id', myTeamId);
         if (error) { statusError = error.message; return; }
-        challenges = (data ?? []).sort((a: any, b: any) => Number(b.is_active) - Number(a.is_active));
+
+        // Flag targets this team has already compromised. Server also blocks
+        // re-attacks; we tag them here so the UI can mark them "compromised"
+        // and gray out the action buttons rather than hiding them.
+        const { data: myAttacks } = await supabase
+          .from('attacks')
+          .select('defended_challenge_id, judge_verdict, is_successful')
+          .eq('attacker_team_id', myTeamId)
+          .not('defended_challenge_id', 'is', null);
+        const compromisedIds = new Set(
+          (myAttacks ?? [])
+            .filter((row: any) => row.judge_verdict ? row.judge_verdict === 'full' : row.is_successful === true)
+            .map((row: any) => row.defended_challenge_id)
+        );
+
+        challenges = (data ?? [])
+          .map((row: any) => ({ ...row, compromised_by_me: compromisedIds.has(row.id) }))
+          .sort((a: any, b: any) => {
+            if (a.compromised_by_me !== b.compromised_by_me) {
+              return Number(a.compromised_by_me) - Number(b.compromised_by_me);
+            }
+            return Number(b.is_active) - Number(a.is_active);
+          });
       } else {
         const { data, error } = await supabase
           .from('challenges')
@@ -509,7 +657,7 @@
   });
 </script>
 
-<div class="p-8 max-w-6xl mx-auto space-y-8">
+<div class="p-8 max-w-7xl mx-auto space-y-8">
   <div class="border-b border-white/10 pb-6">
     <div class="mb-4">
       <GameSectionNav gameId={gameId} current="attack" />
@@ -529,7 +677,7 @@
     <div class="bg-red-500/10 border border-red-500 text-red-500 p-4 rounded-md">{statusError}</div>
   {/if}
 
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
     <!-- Left: target list -->
     <div class="col-span-1 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl overflow-hidden h-[48rem] flex flex-col shadow-xl">
       <div class="p-4 border-b border-white/10 bg-black/40 sticky top-0 z-10">
@@ -541,14 +689,16 @@
             class="w-full text-left p-5 hover:bg-slate-800/80 transition-all block group {selectedChallengeId === target.id ? 'bg-red-500/10 border-l-4 border-red-500' : 'border-l-4 border-transparent'}"
             onclick={() => selectedChallengeId = target.id}
           >
-            <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors flex items-center gap-2">
+            <div class="font-bold mb-1 group-hover:text-red-300 transition-colors flex items-center gap-2 {target.compromised_by_me ? 'text-gray-400' : 'text-white'}">
               {target.teams?.name || 'Default Defense'}
-              {#if hasActiveSession(target.id)}
+              {#if target.compromised_by_me}
+                <span class="text-[10px] font-normal uppercase tracking-wider text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 rounded">Compromised</span>
+              {:else if hasActiveSession(target.id)}
                 <span class="text-[10px] font-normal uppercase tracking-wider text-amber-300 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded">In Progress</span>
               {/if}
             </div>
-            <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.name || target.challenges?.model_name} · {target.challenges?.type}</div>
-            <div class="text-xs mb-2 {target.is_active ? 'text-emerald-300' : 'text-amber-300'}">{target.is_active ? 'Active Defense' : 'Inactive Defense'}</div>
+            <div class="text-xs text-gray-400 mb-3 truncate font-mono {target.compromised_by_me ? 'opacity-60' : ''}">{target.challenges?.name || target.challenges?.model_name} · {target.challenges?.type} · <span class="text-gray-500">{target.challenges?.model_name}</span></div>
+            <div class="text-xs mb-2 {target.is_active ? 'text-emerald-300' : 'text-amber-300'} {target.compromised_by_me ? 'opacity-60' : ''}">{target.is_active ? 'Active Defense' : 'Inactive Defense'}</div>
             <div class="text-xs text-gray-300">{attackMode === 'pvp' ? `Team Coins: ${target.teams?.coins ?? 0}` : 'Default prompt target'}</div>
             <div class="text-xs text-gray-500 mt-1">Base steal value: {target.challenges?.attack_steal_coins ?? 0}</div>
           </button>
@@ -562,7 +712,7 @@
     </div>
 
     <!-- Right: inline chat -->
-    <div class="col-span-1 md:col-span-2 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl shadow-xl flex flex-col h-[48rem]">
+    <div class="col-span-1 md:col-span-3 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl shadow-xl flex flex-col h-[48rem] overflow-hidden">
       {#if !selectedTarget}
         <div class="flex-1 flex items-center justify-center">
           <div class="text-center text-gray-500 space-y-3">
@@ -577,7 +727,7 @@
           <div>
             <p class="text-white font-bold">
               {selectedTarget.teams?.name || 'Default Defense'}
-              <span class="text-gray-400 font-normal ml-2">{selectedTarget.challenges?.name || selectedTarget.challenges?.model_name} · {selectedTarget.challenges?.type}</span>
+              <span class="text-gray-400 font-normal ml-2">{selectedTarget.challenges?.name || selectedTarget.challenges?.model_name} · {selectedTarget.challenges?.type} · <span class="text-gray-500 font-mono">{selectedTarget.challenges?.model_name}</span></span>
             </p>
             <p class="text-xs text-gray-500 mt-1">{selectedTarget.challenges?.description}</p>
           </div>
@@ -585,6 +735,13 @@
             Clear Chat
           </button>
         </div>
+
+        {#if selectedTargetCompromised}
+          <div class="px-4 py-3 border-b border-emerald-500/30 bg-emerald-500/10 text-emerald-200 text-sm flex items-center gap-2">
+            <span class="font-bold uppercase tracking-wider text-xs">✓ Compromised</span>
+            <span class="text-emerald-300/80">Your team has already breached this defense. Further attacks are disabled.</span>
+          </div>
+        {/if}
 
         <!-- Messages -->
         <div class="flex-1 overflow-y-auto p-4 space-y-3">
@@ -605,27 +762,61 @@
           {#if attackResult}
             {@const isSuccess = !!attackResult.success}
             {@const isError = !!attackResult.error}
-            <div class="p-4 rounded-xl border {isSuccess ? 'bg-green-500/10 border-green-500/50 text-green-400' : isError ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-amber-500/10 border-amber-500/50 text-amber-300'}">
-              <div class="font-black text-lg mb-2">{isSuccess ? '✅ TARGET COMPROMISED!' : isError ? '⚠️ ATTACK ERROR' : '↻ ATTEMPT COMPLETE - KEEP PUSHING'}</div>
-              <div class="text-sm opacity-90 font-medium">{attackResult.message || attackResult.error || 'No compromise yet. Refine your prompt and try again.'}</div>
-              {#if isSuccess && typeof attackResult.bonus_coins === 'number' && attackResult.bonus_coins > 0}
-                <div class="mt-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs font-mono">
-                  <div class="font-semibold">⚡ Elegance bonus: +{attackResult.bonus_coins} coins</div>
-                  <div class="opacity-80 mt-1">
-                    {attackResult.base_coins ?? 0} base + {attackResult.bonus_coins} bonus = {attackResult.stolen_coins ?? 0} total
+            {@const isEscalated = attackResult.escalated === true}
+            {@const judgeVerdict = attackResult.verdict as string | undefined}
+            {#if isEscalated}
+              <div class="p-4 rounded-xl border bg-amber-500/10 border-amber-500/50 text-amber-300">
+                <div class="font-black text-lg mb-2">⏳ PENDING REVIEW</div>
+                <div class="text-sm opacity-90 font-medium">{attackResult.message || 'Attack submitted to admin for review.'}</div>
+                {#if typeof attackResult.escrow_amount === 'number'}
+                  <div class="mt-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs font-mono">
+                    <span class="font-semibold">{attackResult.escrow_amount} coins</span> held in escrow. Max potential payout: {attackResult.max_potential_total ?? '?'}.
+                  </div>
+                {/if}
+              </div>
+            {:else if judgeVerdict}
+              {@const isRealTier = judgeVerdict !== 'escalate'}
+              {@const verdictColor = judgeVerdict === 'full' || judgeVerdict === 'substantial' ? 'green' : judgeVerdict === 'partial' ? 'amber' : judgeVerdict === 'structural' ? 'amber' : 'red'}
+              <div class="p-4 rounded-xl border bg-{verdictColor}-500/10 border-{verdictColor}-500/50 text-{verdictColor}-400">
+                <div class="font-black text-lg mb-2">⚖️ JUDGE VERDICT: {judgeVerdict.toUpperCase()} (×{attackResult.coefficient ?? 0})</div>
+                {#if attackResult.judge_reason}
+                  <div class="text-sm opacity-90 font-medium">{attackResult.judge_reason}</div>
+                {/if}
+                {#if isRealTier && typeof attackResult.stolen_coins === 'number'}
+                  <div class="mt-3 px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-xs font-mono text-gray-200">
+                    {#if attackResult.bonus_coins > 0}
+                      <span class="font-semibold">{attackResult.stolen_coins} coins</span> = {attackResult.base_coins ?? 0} base + {attackResult.bonus_coins} bonus
+                    {:else}
+                      <span class="font-semibold">{attackResult.stolen_coins} coins</span> base only
+                    {/if}
                     {#if typeof attackResult.elegance_factor === 'number'}· elegance {Math.round(attackResult.elegance_factor * 100)}%{/if}
                     {#if typeof attackResult.turn_count === 'number'}· {attackResult.turn_count} {attackResult.turn_count === 1 ? 'turn' : 'turns'}{/if}
                   </div>
-                </div>
-              {:else if isSuccess && typeof attackResult.base_coins === 'number'}
-                <div class="mt-3 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-gray-300 text-xs font-mono">
-                  Base reward: {attackResult.base_coins} coins (elegance exhausted, no bonus)
-                </div>
-              {/if}
-              {#if attackResult.log}
-                <div class="mt-3 text-xs bg-black/60 p-3 rounded-lg text-gray-300 font-mono max-h-44 overflow-y-auto border border-white/5">{attackResult.log}</div>
-              {/if}
-            </div>
+                {/if}
+              </div>
+            {:else}
+              <div class="p-4 rounded-xl border {isSuccess ? 'bg-green-500/10 border-green-500/50 text-green-400' : isError ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-amber-500/10 border-amber-500/50 text-amber-300'}">
+                <div class="font-black text-lg mb-2">{isSuccess ? '✅ TARGET COMPROMISED!' : isError ? '⚠️ ATTACK ERROR' : '↻ ATTEMPT COMPLETE - KEEP PUSHING'}</div>
+                <div class="text-sm opacity-90 font-medium">{attackResult.message || attackResult.error || 'No compromise yet. Refine your prompt and try again.'}</div>
+                {#if isSuccess && typeof attackResult.bonus_coins === 'number' && attackResult.bonus_coins > 0}
+                  <div class="mt-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs font-mono">
+                    <div class="font-semibold">⚡ Elegance bonus: +{attackResult.bonus_coins} coins</div>
+                    <div class="opacity-80 mt-1">
+                      {attackResult.base_coins ?? 0} base + {attackResult.bonus_coins} bonus = {attackResult.stolen_coins ?? 0} total
+                      {#if typeof attackResult.elegance_factor === 'number'}· elegance {Math.round(attackResult.elegance_factor * 100)}%{/if}
+                      {#if typeof attackResult.turn_count === 'number'}· {attackResult.turn_count} {attackResult.turn_count === 1 ? 'turn' : 'turns'}{/if}
+                    </div>
+                  </div>
+                {:else if isSuccess && typeof attackResult.base_coins === 'number'}
+                  <div class="mt-3 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-gray-300 text-xs font-mono">
+                    Base reward: {attackResult.base_coins} coins (elegance exhausted, no bonus)
+                  </div>
+                {/if}
+                {#if attackResult.log}
+                  <div class="mt-3 text-xs bg-black/60 p-3 rounded-lg text-gray-300 font-mono max-h-44 overflow-y-auto border border-white/5">{attackResult.log}</div>
+                {/if}
+              </div>
+            {/if}
           {/if}
         </div>
 
@@ -633,58 +824,111 @@
         <div class="p-4 border-t border-white/10 bg-black/20 space-y-3">
           <div class="flex items-center justify-between flex-wrap gap-2">
             <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Attack Prompt</p>
-            <div class="px-3 py-1.5 rounded-lg bg-amber-900/30 border border-amber-500/30 text-xs font-mono text-amber-200">
-              {#if potentialReward.base === 0}
-                Reward: <strong>0</strong> (no steal configured)
-              {:else if potentialReward.bonus > 0}
-                Reward: <strong class="text-amber-100">{potentialReward.total}</strong>
-                = {potentialReward.base} + <strong class="text-green-300">{potentialReward.bonus}</strong> bonus
-                <span class="text-amber-400/70">· {Math.round(potentialReward.eleganceFactor * 100)}%</span>
-              {:else}
-                Reward: <strong>{potentialReward.base}</strong> base only
-              {/if}
-            </div>
-          </div>
-          <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-24 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm" placeholder="> Type your attack prompt..."></textarea>
-          <div class="space-y-2 rounded-xl border border-dashed border-white/15 bg-black/30 p-4">
-            <div class="flex items-center justify-between gap-3 flex-wrap">
-              <div>
-                <p class="text-sm font-semibold text-gray-200">Attach files</p>
-                <p class="text-xs text-gray-500">Text attachments only for now. Total limit: {MAX_UPLOAD_MB} MB.</p>
+            {#if serverTurnCount === null}
+              <!-- Server hasn't reported the count yet. Show a placeholder
+                   instead of a number so we never display an inflated reward. -->
+              <div class="px-3 py-1.5 rounded-lg bg-black/40 border border-white/10 text-xs font-mono text-gray-500">
+                loading reward…
               </div>
-              <button type="button" onclick={clearAttachments} class="text-xs text-gray-400 hover:text-white transition-colors" disabled={selectedFiles.length === 0}>Clear attachments</button>
+            {:else if selectedTarget?.challenges?.type === 'judge'}
+              <!-- Judge challenges: coefficient is picked by the judge, so the
+                   preview above doesn't reflect the actual payout — only the
+                   max (full verdict). Show that max honestly and surface the
+                   per-tier breakdown below. -->
+              <div class="px-3 py-1.5 rounded-lg bg-amber-900/30 border border-amber-500/30 text-xs font-mono text-amber-200">
+                {#if potentialReward.base === 0}
+                  Reward: <strong>0</strong> (no steal configured)
+                {:else}
+                  Max reward: <strong class="text-amber-100">{potentialReward.total}</strong>
+                  <span class="text-amber-400/70">· judge picks tier · turn {(serverTurnCount ?? 0) + 1}</span>
+                {/if}
+              </div>
+            {:else}
+              <div class="px-3 py-1.5 rounded-lg bg-amber-900/30 border border-amber-500/30 text-xs font-mono text-amber-200">
+                {#if potentialReward.base === 0}
+                  Reward: <strong>0</strong> (no steal configured)
+                {:else if potentialReward.bonus > 0}
+                  Reward: <strong class="text-amber-100">{potentialReward.total}</strong>
+                  = {potentialReward.base} + <strong class="text-green-300">{potentialReward.bonus}</strong> bonus
+                  <span class="text-amber-400/70">· {Math.round(potentialReward.eleganceFactor * 100)}% · turn {(serverTurnCount ?? 0) + 1}</span>
+                {:else}
+                  Reward: <strong>{potentialReward.base}</strong> base only
+                {/if}
+              </div>
+            {/if}
+          </div>
+          {#if selectedTarget?.challenges?.type === 'judge' && potentialReward.base > 0}
+            {@const stealCoins = selectedTarget?.challenges?.attack_steal_coins ?? 0}
+            {@const defenseReward = selectedTarget?.challenges?.defense_reward_coins ?? 0}
+            {@const elegance = potentialReward.eleganceFactor}
+            {@const tiersBreakdown = [
+              { name: 'none', coef: 0 },
+              { name: 'structural', coef: 0.25 },
+              { name: 'partial', coef: 0.5 },
+              { name: 'substantial', coef: 0.75 },
+              { name: 'full', coef: 1 }
+            ].map((t) => {
+              const scaledBase = Math.floor(stealCoins * t.coef);
+              const scaledMaxBonus = Math.min(defenseReward, 3 * scaledBase);
+              const scaledBonus = Math.floor(scaledMaxBonus * elegance);
+              return { ...t, total: scaledBase + scaledBonus };
+            })}
+            <div class="px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-[11px] font-mono text-gray-400 flex gap-3 flex-wrap">
+              <span class="text-gray-500">tier payouts at current elegance ({Math.round(elegance * 100)}%):</span>
+              {#each tiersBreakdown as t}
+                <span><span class="text-gray-500">{t.name}:</span> <span class="text-gray-200">{t.total}</span></span>
+              {/each}
             </div>
-            <input
-              type="file"
-              multiple
-              accept=".txt,.md,.csv,.json,.log,text/plain,text/markdown,text/csv,application/json"
-              onchange={handleFileSelection}
-              class="block w-full text-sm text-gray-300 file:mr-4 file:rounded-lg file:border-0 file:bg-red-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:bg-red-500"
-            />
+          {/if}
+          <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-28 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm resize-y" placeholder="> Type your attack prompt..."></textarea>
+          <!-- Compact row: file attach button + file chips + send prompt -->
+          <div class="flex items-center gap-2 flex-wrap">
+            <label class="shrink-0 cursor-pointer px-3 py-2 rounded-lg border border-white/15 bg-white/5 text-xs text-gray-200 hover:bg-white/10 transition-colors font-medium" title="Attach text files (max {MAX_UPLOAD_MB} MB total)">
+              📎 Attach{selectedFiles.length > 0 ? ` (${selectedFiles.length})` : ''}
+              <input
+                type="file"
+                multiple
+                accept=".txt,.md,.csv,.json,.log,text/plain,text/markdown,text/csv,application/json"
+                onchange={handleFileSelection}
+                class="hidden"
+              />
+            </label>
             {#if selectedFiles.length > 0}
-              <div class="flex flex-wrap gap-2 text-xs text-gray-300">
+              <button type="button" onclick={clearAttachments} class="shrink-0 text-[11px] text-gray-400 hover:text-white transition-colors underline">clear</button>
+              <div class="flex flex-wrap gap-1 text-[10px] text-gray-400 flex-1 min-w-0">
                 {#each selectedFiles as file}
-                  <span class="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono">{file.name} · {formatFileSize(file.size)}</span>
+                  <span class="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono truncate">{file.name} · {formatFileSize(file.size)}</span>
                 {/each}
               </div>
+            {:else}
+              <span class="text-[11px] text-gray-500 flex-1">Text only · {MAX_UPLOAD_MB} MB max</span>
             {/if}
-            {#if attachmentError}
-              <p class="text-xs text-red-300">{attachmentError}</p>
-            {/if}
-          </div>
-          <div class="flex gap-3">
-            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim() || !!attachmentError} class="flex-1 bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold disabled:opacity-50 transition-all uppercase">
+            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim() || !!attachmentError || selectedTargetCompromised} class="shrink-0 bg-red-600 hover:bg-red-500 text-white px-6 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
               {chatLoading ? 'SENDING...' : 'Send Prompt'}
             </button>
+            {#if selectedTarget?.challenges?.type === 'judge'}
+              <button onclick={endAttack} disabled={chatLoading || messages.filter((m) => m.role === 'user').length === 0 || selectedTargetCompromised} class="shrink-0 border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 px-4 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm" title="Commit this transcript to the judge. Coins settle on verdict or go to escrow.">
+                {chatLoading ? 'JUDGING...' : '⚖️ End Attack'}
+              </button>
+            {/if}
           </div>
+          {#if attachmentError}
+            <p class="text-xs text-red-300">{attachmentError}</p>
+          {/if}
 
           {#if selectedTarget?.challenges?.type === 'secret-key'}
             <div class="flex gap-3 pt-2 border-t border-white/10">
-              <input bind:value={secretKeyGuess} class="flex-1 bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none placeholder:text-gray-600 font-mono text-sm" placeholder="Secret key guess..." />
-              <button onclick={submitSecretGuess} disabled={chatLoading || !secretKeyGuess.trim()} class="border border-red-500/40 hover:bg-red-500/10 text-red-400 px-4 py-3 rounded-xl font-bold disabled:opacity-50 transition-all uppercase text-sm">
+              <input bind:value={secretKeyGuess} disabled={selectedTargetCompromised} class="flex-1 bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none placeholder:text-gray-600 font-mono text-sm disabled:opacity-50" placeholder="Secret key guess..." />
+              <button onclick={submitSecretGuess} disabled={chatLoading || !secretKeyGuess.trim() || selectedTargetCompromised} class="border border-red-500/40 hover:bg-red-500/10 text-red-400 px-4 py-3 rounded-xl font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
                 {chatLoading ? '...' : 'Guess'}
               </button>
             </div>
+          {/if}
+
+          {#if selectedTarget?.challenges?.type === 'judge'}
+            <p class="text-[11px] text-gray-500">
+              Judge challenge: no per-turn coin transfer — click <span class="text-amber-400">End Attack</span> when ready to commit the transcript to the judge.
+            </p>
           {/if}
         </div>
       {/if}

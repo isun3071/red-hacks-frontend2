@@ -323,7 +323,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
       <div>
           <h2 class="text-2xl font-bold text-white">{challenge.name || challenge.model_name}</h2>
         <p class="text-sm text-gray-400 mt-1">{challenge.description}</p>
-        <p class="text-xs text-gray-500 mt-2">Defense reward: {challenge.defense_reward_coins ?? 0} coins • Attack steal value: {challenge.attack_steal_coins ?? 0} coins</p>
+        <p class="text-xs text-gray-500 mt-2">Model: <span class="text-gray-300 font-mono">{challenge.model_name}</span> · Type: {challenge.type} · Defense reward: {challenge.defense_reward_coins ?? 0} coins · Steal value: {challenge.attack_steal_coins ?? 0} coins</p>
       </div>
 
       <div class="space-y-2">

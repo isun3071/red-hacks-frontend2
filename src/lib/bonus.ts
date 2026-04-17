@@ -20,14 +20,19 @@ export type AttackBonusInput = {
 	charCount: number; // >= 0; total chars including current prompt
 	attackStealCoins: number; // challenges.attack_steal_coins
 	defenseRewardCoins: number; // challenges.defense_reward_coins
+	// Judge coefficient for `judge`-type challenges. 0..1. Defaults to 1.0
+	// so non-judge callers are untouched. Applied to base BEFORE computing
+	// maxBonus, so the bonus ceiling shrinks proportionally with coefficient.
+	coefficient?: number;
 };
 
 export type AttackBonusResult = {
-	base: number; // = max(0, attack_steal_coins)
+	base: number; // coefficient-adjusted base (= attack_steal_coins × coefficient)
 	bonus: number; // >= 0, integer, floored
 	total: number; // base + bonus
 	eleganceFactor: number; // 0..1, for UI display
-	maxBonus: number; // min(defense_reward_coins, 3*base), for UI display
+	maxBonus: number; // min(defense_reward_coins, 3 × adjusted_base), for UI display
+	coefficient: number; // echoed back, clamped to [0, 1]
 };
 
 function sanitizeInteger(value: number, minimum: number): number {
@@ -37,8 +42,20 @@ function sanitizeInteger(value: number, minimum: number): number {
 	return Math.max(minimum, Math.trunc(value));
 }
 
+function clampCoefficient(value: number | undefined): number {
+	if (typeof value !== 'number' || Number.isNaN(value)) return 1;
+	if (value < 0) return 0;
+	if (value > 1) return 1;
+	return value;
+}
+
 export function calculateAttackBonus(input: AttackBonusInput): AttackBonusResult {
-	const base = sanitizeInteger(input.attackStealCoins, 0);
+	const rawBase = sanitizeInteger(input.attackStealCoins, 0);
+	const coefficient = clampCoefficient(input.coefficient);
+	// Coefficient scales base BEFORE the bonus formula uses it, so a
+	// partial verdict shrinks both the base steal and the bonus ceiling
+	// together (the `3 × base` term). A verdict of 0 produces 0 total.
+	const base = Math.floor(rawBase * coefficient);
 	const defenseReward = sanitizeInteger(input.defenseRewardCoins, 0);
 	const maxBonus = Math.min(defenseReward, 3 * base);
 
@@ -52,5 +69,5 @@ export function calculateAttackBonus(input: AttackBonusInput): AttackBonusResult
 	const bonus = Math.floor(maxBonus * eleganceFactor);
 	const total = base + bonus;
 
-	return { base, bonus, total, eleganceFactor, maxBonus };
+	return { base, bonus, total, eleganceFactor, maxBonus, coefficient };
 }

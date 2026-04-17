@@ -1,6 +1,16 @@
 import { env } from '$env/dynamic/private';
 import { PUBLIC_MAX_UPLOAD_MB, PUBLIC_SUPABASE_URL } from '$env/static/public';
 import { calculateAttackBonus, type AttackBonusResult } from '$lib/bonus';
+import {
+  buildJudgeUserMessage,
+  DEFAULT_JUDGE_MODEL,
+  DEFAULT_JUDGE_TEMPERATURE,
+  JUDGE_SYSTEM_PROMPT,
+  parseJudgeResponse,
+  TIER_COEFFICIENTS,
+  type JudgeRubric,
+  type JudgeVerdict
+} from '$lib/judge';
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient } from '@supabase/supabase-js';
 
@@ -36,6 +46,9 @@ type AttackRequestBody = {
     content?: string;
   }>;
   challenge?: unknown;
+  // judge-type challenges: set true on the End Attack click to trigger
+  // the judge LLM evaluation over the full transcript.
+  end_attack?: boolean;
 };
 
 type AttachmentSummary = {
@@ -191,6 +204,75 @@ function asValidDateMs(value: string | null | undefined): number | null {
   if (Number.isNaN(ms)) return null;
 
   return ms;
+}
+
+/**
+ * Call the judge LLM via OpenRouter to evaluate a judge-type challenge
+ * attack transcript. Returns a parsed verdict or {ok:false} on any
+ * failure (API, parse, validation). Callers treat !ok as escalate.
+ */
+async function callJudgeLlm(args: {
+  rubric: JudgeRubric | null | undefined;
+  defenderSystemPrompt: string | null | undefined;
+  transcript: Array<{ role: string; content: string }>;
+  challengeModel?: string | null;
+}): Promise<
+  | { ok: true; verdict: JudgeVerdict; coefficient: number | null; reason: string; model: string }
+  | { ok: false; reason: string }
+> {
+  const openRouterKey = env.OPENROUTER_KEY?.trim();
+  if (!openRouterKey) {
+    return { ok: false, reason: 'OPENROUTER_KEY missing; judge cannot run' };
+  }
+
+  const model = (args.challengeModel && args.challengeModel.trim()) || env.JUDGE_MODEL?.trim() || DEFAULT_JUDGE_MODEL;
+  const temperatureRaw = Number(env.JUDGE_TEMPERATURE);
+  const temperature = Number.isFinite(temperatureRaw) ? temperatureRaw : DEFAULT_JUDGE_TEMPERATURE;
+
+  const userMessage = buildJudgeUserMessage({
+    rubric: args.rubric,
+    defenderSystemPrompt: args.defenderSystemPrompt,
+    transcript: args.transcript
+  });
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openRouterKey}`
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: JUDGE_SYSTEM_PROMPT },
+          { role: 'user', content: userMessage }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return { ok: false, reason: `judge API ${response.status}: ${errText.slice(0, 200)}` };
+    }
+
+    const body = await response.json();
+    const content = body?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string') {
+      return { ok: false, reason: 'judge response had no content' };
+    }
+
+    const parsed = parseJudgeResponse(content);
+    if (!parsed.ok) {
+      return { ok: false, reason: parsed.reason };
+    }
+
+    return { ok: true, verdict: parsed.verdict, coefficient: parsed.coefficient, reason: parsed.reason, model };
+  } catch (err: any) {
+    return { ok: false, reason: err?.message || 'judge fetch threw' };
+  }
 }
 
 function normalizeMinutes(value: number | null | undefined, minimum: number): number {
@@ -657,6 +739,32 @@ export const POST: RequestHandler = async ({ params, request }) => {
         return json({ success: false, error: 'You cannot attack your own team defense' }, { status: 400 });
       }
 
+      // Block re-attacks once this attacker team has already fully compromised
+      // this specific defense. Non-judge challenges: any is_successful=true row
+      // counts. Judge challenges: only a 'full' verdict (coefficient=1) counts —
+      // partial compromises are not final, so the attacker can keep trying.
+      const { data: priorCompromises } = await supabaseAdmin
+        .from('attacks')
+        .select('id, judge_verdict, is_successful')
+        .eq('attacker_team_id', attackerTeamId)
+        .eq('defended_challenge_id', defendedChallengeId);
+
+      const alreadyCompromised = (priorCompromises ?? []).some((row: any) => {
+        if (row.judge_verdict) return row.judge_verdict === 'full';
+        return row.is_successful === true;
+      });
+
+      if (alreadyCompromised) {
+        return json(
+          {
+            success: false,
+            already_compromised: true,
+            error: 'You have already compromised this defense. You cannot attack it again.'
+          },
+          { status: 403 }
+        );
+      }
+
       if ((defendedTarget.teams?.coins ?? 0) <= 0) {
         return json(
           {
@@ -675,6 +783,237 @@ export const POST: RequestHandler = async ({ params, request }) => {
       return json({ success: false, error: 'Could not resolve the challenge for this attack.' }, { status: 500 });
     }
 
+    // ---------- End Attack: judge-evaluated challenges ----------
+    // For judge-type challenges, individual prompts are forwarded normally
+    // (no per-turn success check / coin transfer). On End Attack the judge
+    // LLM evaluates the full transcript and we settle (or escrow) once.
+    const challengeType = targetDetails?.challenges?.type as string | undefined;
+    const isJudgeChallenge = challengeType === 'judge';
+
+    if (body.end_attack === true) {
+      if (!isJudgeChallenge) {
+        return json({ success: false, error: 'End Attack is only supported on judge-type challenges.' }, { status: 400 });
+      }
+
+      if (isPveTarget) {
+        return json({ success: false, error: 'Judge challenges in PvE mode are not yet supported.' }, { status: 400 });
+      }
+
+      if (!attackerTeamId || !targetDetails?.team_id) {
+        return json({ success: false, error: 'Missing team context for judge settlement.' }, { status: 400 });
+      }
+
+      const rubric = (targetDetails?.challenges?.judge_rubric ?? null) as JudgeRubric | null;
+      const judgeModel = typeof targetDetails?.challenges?.judge_model === 'string' ? targetDetails.challenges.judge_model : null;
+      const defenderSystemPrompt = typeof targetDetails?.system_prompt === 'string' ? targetDetails.system_prompt : null;
+      const transcript = normalizeMessages(body.messages).map((m) => ({ role: m.role, content: m.content }));
+
+      const judgeResult = await callJudgeLlm({
+        rubric,
+        defenderSystemPrompt,
+        transcript,
+        challengeModel: judgeModel
+      });
+
+      // Snapshot the inputs used for bonus calc so admin review is deterministic.
+      const challengeStealCoins = Math.max(0, Math.trunc(targetDetails?.challenges?.attack_steal_coins ?? 0));
+      const challengeDefenseReward = Math.max(0, Math.trunc(targetDetails?.challenges?.defense_reward_coins ?? 0));
+
+      // Count all per-turn attempts this team has logged against this target
+      // since the last successful attack / defender prompt update / now. This
+      // is the server-authoritative turn count — it includes turns the user
+      // cleared on the client via Clear Chat, so clearing doesn't game the bonus.
+      const { data: lastSuccess } = await supabaseAdmin
+        .from('attacks')
+        .select('created_at')
+        .eq('attacker_team_id', attackerTeamId)
+        .eq('defended_challenge_id', targetDetails.id)
+        .eq('is_successful', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const lastSuccessMs = lastSuccess?.created_at ? new Date(lastSuccess.created_at).getTime() : 0;
+      const updatedAtMs = targetDetails?.updated_at ? new Date(targetDetails.updated_at).getTime() : 0;
+      const windowStartIso = new Date(Math.max(lastSuccessMs, updatedAtMs)).toISOString();
+
+      const { data: priorTurns } = await supabaseAdmin
+        .from('attacks')
+        .select('log')
+        .eq('attacker_team_id', attackerTeamId)
+        .eq('defended_challenge_id', targetDetails.id)
+        .eq('is_successful', false)
+        .gt('created_at', windowStartIso);
+
+      // Fall back to client transcript if the server count is somehow empty
+      // (shouldn't happen now that per-turn prompts log, but defensive).
+      const clientTurnCount = transcript.filter((m) => m.role === 'user').length;
+      const clientCharCount = transcript.filter((m) => m.role === 'user').reduce((acc, m) => acc + m.content.length, 0);
+
+      const serverTurnCount = priorTurns?.length ?? 0;
+      const serverCharCount = (priorTurns ?? []).reduce((acc, row: any) => {
+        const p = row?.log?.latest_prompt;
+        return acc + (typeof p === 'string' ? p.length : 0);
+      }, 0);
+
+      const userTurnCount = Math.max(serverTurnCount, clientTurnCount);
+      const userCharCount = Math.max(serverCharCount, clientCharCount);
+
+      const escrowSnapshot = {
+        attack_steal_coins: challengeStealCoins,
+        defense_reward_coins: challengeDefenseReward,
+        turn_count: userTurnCount,
+        char_count: userCharCount
+      };
+
+      const maxPotential = calculateAttackBonus({
+        turnCount: userTurnCount,
+        charCount: userCharCount,
+        attackStealCoins: challengeStealCoins,
+        defenseRewardCoins: challengeDefenseReward,
+        coefficient: 1
+      });
+
+      // Escalate path (judge failed or explicitly escalated): hold escrow from defender, no payout yet.
+      if (!judgeResult.ok || judgeResult.verdict === 'escalate') {
+        const escalateReason = judgeResult.ok ? judgeResult.reason : judgeResult.reason;
+        const heldAmount = Math.min(targetDetails.teams?.coins ?? 0, maxPotential.total);
+
+        let defenderCoinsAfter: number | null = targetDetails.teams?.coins ?? null;
+        let defenderEliminated = false;
+        if (heldAmount > 0) {
+          const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -heldAmount);
+          if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
+          if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
+            defenderEliminated = true;
+            await supabaseAdmin
+              .from('defended_challenges')
+              .update({ is_active: false })
+              .eq('team_id', targetDetails.team_id);
+          }
+        }
+
+        const attackLog = {
+          source: 'judge',
+          outcome: 'escalated',
+          latest_prompt: '(end attack)',
+          escalation_reason: escalateReason,
+          escrow_amount: heldAmount,
+          escrow_snapshot: escrowSnapshot,
+          max_potential_total: maxPotential.total,
+          transcript_length: transcript.length,
+          defender_coins_after: defenderCoinsAfter,
+          defender_eliminated: defenderEliminated
+        };
+
+        await supabaseAdmin.from('attacks').insert({
+          defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+          challenge_id: effectiveChallengeId,
+          attacker_user_id: attackerUserId,
+          attacker_team_id: attackerTeamId,
+          is_successful: false, // coins haven't moved to attacker yet
+          log: attackLog,
+          judge_verdict: 'escalate',
+          judge_coefficient: null,
+          judge_reason: escalateReason,
+          escalation_status: 'pending',
+          escrow_amount: heldAmount,
+          escrow_snapshot: escrowSnapshot
+        });
+
+        return json({
+          success: false,
+          escalated: true,
+          message: 'Attack submitted for admin review. Coins held in escrow pending decision.',
+          escrow_amount: heldAmount,
+          max_potential_total: maxPotential.total,
+          judge_reason: escalateReason
+        });
+      }
+
+      // Real verdict: settle immediately.
+      const coefficient = TIER_COEFFICIENTS[judgeResult.verdict];
+      const reward = calculateAttackBonus({
+        turnCount: userTurnCount,
+        charCount: userCharCount,
+        attackStealCoins: challengeStealCoins,
+        defenseRewardCoins: challengeDefenseReward,
+        coefficient
+      });
+
+      let defenderCoinsAfter: number | null = targetDetails.teams?.coins ?? null;
+      let attackerCoinsAfter: number | null = null;
+      let defenderEliminated = false;
+      const totalTransfer = Math.min(targetDetails.teams?.coins ?? 0, reward.total);
+
+      if (totalTransfer > 0) {
+        // Zero-sum: subtract from defender, add to attacker.
+        const newDefenderBalance = await incrementTeamCoins(supabaseAdmin, targetDetails.team_id, -totalTransfer);
+        if (typeof newDefenderBalance === 'number') defenderCoinsAfter = newDefenderBalance;
+        if (typeof newDefenderBalance === 'number' && newDefenderBalance <= 0) {
+          defenderEliminated = true;
+          await supabaseAdmin
+            .from('defended_challenges')
+            .update({ is_active: false })
+            .eq('team_id', targetDetails.team_id);
+        }
+
+        const newAttackerBalance = await incrementTeamCoins(supabaseAdmin, attackerTeamId, totalTransfer);
+        if (typeof newAttackerBalance === 'number') attackerCoinsAfter = newAttackerBalance;
+      }
+
+      const attackLog = {
+        source: 'judge',
+        outcome: judgeResult.verdict,
+        latest_prompt: '(end attack)',
+        judge_reason: judgeResult.reason,
+        judge_model: judgeResult.model,
+        base_coins: reward.base,
+        bonus_coins: reward.bonus,
+        stolen_coins: totalTransfer,
+        elegance_factor: reward.eleganceFactor,
+        max_bonus: reward.maxBonus,
+        coefficient,
+        turn_count: userTurnCount,
+        char_count: userCharCount,
+        defender_coins_after: defenderCoinsAfter,
+        attacker_coins_after: attackerCoinsAfter,
+        defender_eliminated: defenderEliminated
+      };
+
+      const cooldownStarts = coefficient > 0;
+      await supabaseAdmin.from('attacks').insert({
+        defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+        challenge_id: effectiveChallengeId,
+        attacker_user_id: attackerUserId,
+        attacker_team_id: attackerTeamId,
+        is_successful: cooldownStarts,
+        log: attackLog,
+        judge_verdict: judgeResult.verdict,
+        judge_coefficient: coefficient,
+        judge_reason: judgeResult.reason,
+        escalation_status: null,
+        escrow_amount: null,
+        escrow_snapshot: escrowSnapshot
+      });
+
+      return json({
+        success: cooldownStarts,
+        verdict: judgeResult.verdict,
+        coefficient,
+        judge_reason: judgeResult.reason,
+        stolen_coins: totalTransfer,
+        base_coins: reward.base,
+        bonus_coins: reward.bonus,
+        elegance_factor: reward.eleganceFactor,
+        max_bonus: reward.maxBonus,
+        turn_count: userTurnCount,
+        char_count: userCharCount,
+        defender_coins_after: defenderCoinsAfter,
+        attacker_coins_after: attackerCoinsAfter,
+        defender_eliminated: defenderEliminated
+      });
+    }
+
     const outboundPayload = buildAttackRequestPayload(body, targetDetails, effectiveChallengeId, targetSecretKey);
     const hasDirectBackend = typeof targetDetails?.challenges?.challenge_url === 'string' && targetDetails.challenges.challenge_url.trim().length > 0;
 
@@ -690,6 +1029,90 @@ export const POST: RequestHandler = async ({ params, request }) => {
       }
     }
 
+    // Judge challenges with no explicit challenge_url: route per-turn
+    // prompts to OpenRouter directly from this Node process. Avoids a
+    // known DNS flake when the Deno-in-Docker edge function tries to
+    // resolve external hostnames. End Attack already goes through
+    // callJudgeLlm() above, which runs here too — so judge challenges
+    // end up fully self-contained in this file.
+    if (isJudgeChallenge && !hasDirectBackend) {
+      const openRouterKey = env.OPENROUTER_KEY?.trim();
+      if (!openRouterKey) {
+        return json({
+          success: false,
+          judge_pending: true,
+          message: 'OPENROUTER_KEY missing on the server; judge challenges cannot run.'
+        });
+      }
+
+      const modelName = targetDetails?.challenges?.model_name || 'openai/gpt-4o-mini';
+      const baseSystemPrompt = (targetDetails?.system_prompt as string | undefined)?.trim()
+        || (targetDetails?.challenges?.default_prompt as string | undefined)?.trim()
+        || 'You are a helpful assistant.';
+      const chatMessages = normalizeMessages(body.messages);
+      const systemMessage = { role: 'system' as const, content: baseSystemPrompt };
+
+      try {
+        const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${openRouterKey}`
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: [systemMessage, ...chatMessages.map((m) => ({ role: m.role, content: m.content }))]
+          })
+        });
+
+        if (!openRouterResponse.ok) {
+          const errText = await openRouterResponse.text();
+          return json({
+            success: false,
+            judge_pending: true,
+            message: `OpenRouter ${openRouterResponse.status}: ${errText.slice(0, 300)}`
+          });
+        }
+
+        const openRouterBody = await openRouterResponse.json();
+        const assistantContent = openRouterBody?.choices?.[0]?.message?.content ?? '';
+
+        // Log the per-turn attempt so the attacks table has the full history
+        // for bonus calc. Without this, Clear Chat "resets" turn counts on the
+        // server because there's no record of prior judge-type prompts.
+        // The End Attack handler later queries these rows via computeEleganceBonus.
+        if (attackerTeamId && targetDetails?.id) {
+          const latestPrompt = body.prompt?.trim() || chatMessages.at(-1)?.content || '';
+          await supabaseAdmin.from('attacks').insert({
+            defended_challenge_id: targetDetails.id,
+            challenge_id: effectiveChallengeId,
+            attacker_user_id: attackerUserId,
+            attacker_team_id: attackerTeamId,
+            is_successful: false,
+            log: {
+              source: 'judge-per-turn',
+              latest_prompt: latestPrompt,
+              assistant_message: String(assistantContent),
+              model_name: modelName
+            }
+          });
+        }
+
+        return json({
+          success: false,
+          judge_pending: true,
+          message: 'Prompt evaluated by the model. Click End Attack when ready to submit to the judge.',
+          assistant: String(assistantContent)
+        });
+      } catch (err: any) {
+        return json({
+          success: false,
+          judge_pending: true,
+          message: err?.message || 'Failed to reach OpenRouter.'
+        });
+      }
+    }
+
     const targetUrl = hasDirectBackend
       ? targetDetails.challenges.challenge_url
       : `${supabaseUrl.replace(/\/$/, '')}/functions/v1/attack`;
@@ -701,7 +1124,17 @@ export const POST: RequestHandler = async ({ params, request }) => {
       mode: 'cors'
     });
 
-    if (hasDirectBackend && response.ok && parsedBody && typeof parsedBody === 'object' && (parsedBody as any).success === true) {
+    // For judge-type challenges, per-turn responses from the backend are
+    // forwarded as-is with no coin transfer — settlement happens only on
+    // End Attack via the judge above. Skip the normal success/coin block.
+    if (isJudgeChallenge) {
+      // Force success:false so the frontend doesn't show "target compromised"
+      // on individual turns. The chat UI still shows the model's reply.
+      if (parsedBody && typeof parsedBody === 'object') {
+        (parsedBody as any).success = false;
+        (parsedBody as any).judge_pending = true;
+      }
+    } else if (hasDirectBackend && response.ok && parsedBody && typeof parsedBody === 'object' && (parsedBody as any).success === true) {
       const backendReportedTransfer =
         typeof (parsedBody as any).stolen_coins === 'number' ||
         typeof (parsedBody as any).attacker_coins_after === 'number' ||

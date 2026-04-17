@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { DEFAULT_JUDGE_MODEL, DEFAULT_TIER_DESCRIPTIONS, type JudgeRubric, type JudgeTier } from '$lib/judge';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
@@ -24,10 +25,143 @@
   let editingChallengeId = $state<string | null>(null);
   let errorMsg = $state('');
 
+  // Judge-type fields
+  let judge_model = $state('');
+  let judge_rubric_text = $state<Record<JudgeTier, string>>({ ...DEFAULT_TIER_DESCRIPTIONS });
+  let judge_context = $state('');
+
+  // Model validation state
+  type ORModel = { id: string; name: string | null; context_length: number | null; pricing: { prompt?: string; completion?: string } | null };
+  let modelList = $state<ORModel[]>([]);
+  let modelListLoading = $state(false);
+  let modelListError = $state('');
+  let validatingField = $state<'target' | 'judge' | null>(null);
+  let modelValidation = $state<{ target?: string; judge?: string }>({});
+
+  const INTERNAL_MODELS = new Set(['llama-interp-server']);
+
+  async function loadModelList(force = false) {
+    if (modelListLoading) return;
+    if (!force && modelList.length > 0) return;
+
+    modelListLoading = true;
+    modelListError = '';
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        modelListError = 'Session expired. Sign in again to load model list.';
+        return;
+      }
+      const response = await fetch('/admin/models/list', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const data = await response.json();
+      if (!response.ok || data?.ok !== true) {
+        modelListError = data?.error ?? `Failed to load model list (${response.status}).`;
+        return;
+      }
+      modelList = data.models as ORModel[];
+    } catch (err: any) {
+      modelListError = err?.message ?? 'Could not load model list.';
+    } finally {
+      modelListLoading = false;
+    }
+  }
+
+  function isValidModelString(m: string): boolean {
+    const trimmed = m.trim();
+    if (!trimmed) return false;
+    if (INTERNAL_MODELS.has(trimmed.toLowerCase()) || trimmed.toLowerCase().includes('llama-interp')) return true;
+    return modelList.some((x) => x.id === trimmed);
+  }
+
+  function modelListMessage(m: string): string {
+    const trimmed = m.trim();
+    if (!trimmed) return '';
+    if (INTERNAL_MODELS.has(trimmed.toLowerCase()) || trimmed.toLowerCase().includes('llama-interp')) {
+      return '✓ Internal model (llama-interp-server) — skipped catalog check.';
+    }
+    if (modelList.length === 0) {
+      return modelListError ? `⚠ Model list unavailable (${modelListError}). Saving will only do a deep test.` : '…';
+    }
+    return isValidModelString(trimmed)
+      ? `✓ ${trimmed} is in the OpenRouter catalog.`
+      : `✗ "${trimmed}" is not a known OpenRouter model. Check spelling or pick from the autocomplete.`;
+  }
+
+  // Deep test: actually fires a 1-token completion. Catches "model exists but
+  // your key can't call it" or "out of credits" cases the catalog check misses.
+  async function deepTestModel(modelString: string): Promise<{ ok: boolean; message: string }> {
+    if (!modelString || !modelString.trim()) {
+      return { ok: false, message: 'Model name cannot be empty.' };
+    }
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) return { ok: false, message: 'Session expired. Sign in again.' };
+
+      const response = await fetch('/admin/challenges/validate-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ model: modelString.trim() })
+      });
+      const data = await response.json();
+      if (data?.ok === true) {
+        return { ok: true, message: data?.skipped ? (data.message ?? 'Skipped (internal model).') : `✓ Deep test passed: your key can call ${modelString.trim()}.` };
+      }
+      return { ok: false, message: data?.error ?? 'Deep test failed.' };
+    } catch (err: any) {
+      return { ok: false, message: err?.message ?? 'Deep test request failed.' };
+    }
+  }
+
+  async function deepTestTarget() {
+    validatingField = 'target';
+    modelValidation = { ...modelValidation, target: 'Deep testing...' };
+    const result = await deepTestModel(model_name);
+    modelValidation = { ...modelValidation, target: result.message };
+    validatingField = null;
+  }
+
+  async function deepTestJudge() {
+    validatingField = 'judge';
+    modelValidation = { ...modelValidation, judge: 'Deep testing...' };
+    const result = await deepTestModel(judge_model);
+    modelValidation = { ...modelValidation, judge: result.message };
+    validatingField = null;
+  }
+
+  function buildJudgeRubric(): JudgeRubric | null {
+    if (type !== 'judge') return null;
+    const tiers: Partial<Record<JudgeTier, string>> = {};
+    for (const tier of Object.keys(DEFAULT_TIER_DESCRIPTIONS) as JudgeTier[]) {
+      if (judge_rubric_text[tier] && judge_rubric_text[tier].trim() !== DEFAULT_TIER_DESCRIPTIONS[tier]) {
+        tiers[tier] = judge_rubric_text[tier];
+      }
+    }
+    const rubric: JudgeRubric = { tiers };
+    if (judge_context.trim()) rubric.context = judge_context.trim();
+    return rubric;
+  }
+
+  function loadJudgeRubric(rubric: JudgeRubric | null | undefined) {
+    const next: Record<JudgeTier, string> = { ...DEFAULT_TIER_DESCRIPTIONS };
+    if (rubric?.tiers) {
+      for (const tier of Object.keys(next) as JudgeTier[]) {
+        const v = rubric.tiers[tier];
+        if (typeof v === 'string' && v.trim().length > 0) next[tier] = v;
+      }
+    }
+    judge_rubric_text = next;
+    judge_context = rubric?.context ?? '';
+  }
+
   onMount(async () => {
     await fetchChallenges();
     await fetchTools();
     await fetchInterpArgs();
+    void loadModelList();
   });
 
   async function fetchChallenges() {
@@ -60,6 +194,9 @@
     selectedTools = [];
     interp_arg_id = '';
     editingChallengeId = null;
+    judge_model = '';
+    judge_rubric_text = { ...DEFAULT_TIER_DESCRIPTIONS };
+    judge_context = '';
   }
 
   async function upsertChallengeTools(challengeId: string) {
@@ -94,6 +231,34 @@
     loading = true;
     errorMsg = '';
 
+    // Pre-submit validation: check against the OpenRouter catalog.
+    // Cheap (no API call), fast, deterministic. If the admin wants to
+    // verify their key actually has access, they click Deep Test manually.
+    modelValidation = {};
+    if (modelList.length === 0 && !modelListLoading) {
+      // Try to load once more in case the mount fetch failed
+      await loadModelList(true);
+    }
+    if (!isValidModelString(model_name)) {
+      const msg = modelListMessage(model_name);
+      errorMsg = `Model Name invalid: ${msg || 'not in OpenRouter catalog.'}`;
+      modelValidation = { ...modelValidation, target: msg };
+      loading = false;
+      return;
+    }
+    modelValidation = { ...modelValidation, target: modelListMessage(model_name) };
+
+    if (type === 'judge' && judge_model.trim()) {
+      if (!isValidModelString(judge_model)) {
+        const msg = modelListMessage(judge_model);
+        errorMsg = `Judge Model invalid: ${msg || 'not in OpenRouter catalog.'}`;
+        modelValidation = { ...modelValidation, judge: msg };
+        loading = false;
+        return;
+      }
+      modelValidation = { ...modelValidation, judge: modelListMessage(judge_model) };
+    }
+
     try {
       if (editingChallengeId) {
         const { error } = await supabase
@@ -109,7 +274,9 @@
             target_tool_name: type === 'tool-calling' ? target_tool_name || null : null,
             defense_reward_coins,
             attack_steal_coins,
-            interp_arg_id: model_name === 'llama-interp-server' ? (interp_arg_id || null) : null
+            interp_arg_id: model_name === 'llama-interp-server' ? (interp_arg_id || null) : null,
+            judge_rubric: type === 'judge' ? buildJudgeRubric() : null,
+            judge_model: type === 'judge' ? (judge_model.trim() || null) : null
           })
           .eq('id', editingChallengeId);
 
@@ -132,6 +299,8 @@
           defense_reward_coins,
           attack_steal_coins,
           interp_arg_id: interp_arg_id || null,
+          judge_rubric: type === 'judge' ? buildJudgeRubric() : null,
+          judge_model: type === 'judge' ? (judge_model.trim() || null) : null,
           created_by: user?.user?.id || null
         };
 
@@ -172,6 +341,8 @@
     defense_reward_coins = challenge.defense_reward_coins ?? 0;
     attack_steal_coins = challenge.attack_steal_coins ?? 0;
     interp_arg_id = challenge.interp_arg_id ?? '';
+    judge_model = challenge.judge_model ?? '';
+    loadJudgeRubric(challenge.judge_rubric ?? null);
 
     const { data, error } = await supabase
       .from('challenge_tools')
@@ -225,7 +396,31 @@
 
       <div class="space-y-2">
         <p class="text-sm font-medium text-gray-300">Model Name</p>
-        <input bind:value={model_name} placeholder="e.g. gpt-4o, llama-interp-server" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+        <div class="flex gap-2">
+          <input bind:value={model_name} list="openrouter-models" placeholder="e.g. openai/gpt-4o-mini, llama-interp-server" class="flex-1 bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all font-mono text-sm" />
+          <button type="button" onclick={deepTestTarget} disabled={!model_name.trim() || validatingField === 'target'} class="shrink-0 px-3 rounded-md border border-white/20 bg-white/5 text-gray-200 hover:bg-white/10 text-sm font-medium disabled:opacity-50" title="Sends a 1-token completion to verify your API key can actually call this model.">
+            {validatingField === 'target' ? '...' : 'Deep Test'}
+          </button>
+        </div>
+        {#if model_name.trim()}
+          {@const liveMsg = modelListMessage(model_name)}
+          {#if liveMsg}
+            <p class="text-xs font-mono {liveMsg.startsWith('✓') ? 'text-emerald-300' : liveMsg.startsWith('⚠') ? 'text-amber-300' : liveMsg.startsWith('✗') ? 'text-red-400' : 'text-gray-500'}">{liveMsg}</p>
+          {/if}
+        {/if}
+        {#if modelValidation.target && modelValidation.target !== modelListMessage(model_name)}
+          <p class="text-xs font-mono {modelValidation.target.startsWith('✓') ? 'text-emerald-300' : 'text-amber-300'}">
+            {modelValidation.target}
+          </p>
+        {/if}
+        <p class="text-xs text-gray-500">
+          {modelList.length > 0
+            ? `Autocomplete from ${modelList.length.toLocaleString()} OpenRouter models.`
+            : modelListLoading
+              ? 'Loading model catalog…'
+              : 'Catalog unavailable — validation will only run Deep Test.'}
+          <code class="text-gray-400">llama-interp-server</code> is internal and is skipped.
+        </p>
       </div>
 
       <div class="space-y-2">
@@ -233,6 +428,8 @@
         <select bind:value={type} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all">
           <option value="secret-key">Secret Key</option>
           <option value="tool-calling">Tool Calling</option>
+          <option value="keyword">Keyword</option>
+          <option value="judge">Judge (LLM-evaluated, partial credit)</option>
         </select>
       </div>
 
@@ -286,6 +483,68 @@
         </div>
       {/if}
 
+      {#if type === 'judge'}
+        <div class="col-span-2 space-y-4 p-4 rounded-xl border border-amber-500/30 bg-amber-500/5">
+          <div>
+            <h3 class="text-sm font-bold text-amber-300 uppercase tracking-wider">Judge Configuration</h3>
+            <p class="text-xs text-gray-400 mt-1">
+              An LLM will evaluate the attack transcript against the rubric below and return one of 5 tiers.
+              Players commit their attack via an End Attack button; partial credit is awarded per the tier coefficient.
+            </p>
+          </div>
+
+          <div class="space-y-2">
+            <p class="text-sm font-medium text-gray-300">Judge Model</p>
+            <div class="flex gap-2">
+              <input
+                bind:value={judge_model}
+                list="openrouter-models"
+                placeholder="Leave empty to use server default ({DEFAULT_JUDGE_MODEL})"
+                class="flex-1 bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all font-mono text-sm"
+              />
+              <button type="button" onclick={deepTestJudge} disabled={!judge_model.trim() || validatingField === 'judge'} class="shrink-0 px-3 rounded-md border border-white/20 bg-white/5 text-gray-200 hover:bg-white/10 text-sm font-medium disabled:opacity-50" title="Sends a 1-token completion to verify your API key can actually call this model.">
+                {validatingField === 'judge' ? '...' : 'Deep Test'}
+              </button>
+            </div>
+            {#if judge_model.trim()}
+              {@const liveMsgJ = modelListMessage(judge_model)}
+              {#if liveMsgJ}
+                <p class="text-xs font-mono {liveMsgJ.startsWith('✓') ? 'text-emerald-300' : liveMsgJ.startsWith('⚠') ? 'text-amber-300' : liveMsgJ.startsWith('✗') ? 'text-red-400' : 'text-gray-500'}">{liveMsgJ}</p>
+              {/if}
+            {/if}
+            {#if modelValidation.judge && modelValidation.judge !== modelListMessage(judge_model)}
+              <p class="text-xs font-mono {modelValidation.judge.startsWith('✓') ? 'text-emerald-300' : 'text-amber-300'}">
+                {modelValidation.judge}
+              </p>
+            {/if}
+            <p class="text-[11px] text-gray-500">Pick a different lab than the target LLM when possible. Empty = server default (not validated here).</p>
+          </div>
+
+          <div class="space-y-3">
+            <p class="text-sm font-medium text-gray-300">Tier Rubric (what counts as each severity)</p>
+            {#each ['none', 'structural', 'partial', 'substantial', 'full'] as tier (tier)}
+              {@const coef = ({none: 0, structural: 0.25, partial: 0.5, substantial: 0.75, full: 1} as Record<string, number>)[tier]}
+              <div class="space-y-1">
+                <p class="text-xs font-mono text-amber-300 uppercase">{tier} <span class="text-gray-500 font-normal">(×{coef})</span></p>
+                <textarea
+                  bind:value={judge_rubric_text[tier as JudgeTier]}
+                  class="w-full bg-black/40 border border-white/10 rounded-md p-2 text-white text-xs h-16 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none font-mono"
+                ></textarea>
+              </div>
+            {/each}
+          </div>
+
+          <div class="space-y-2">
+            <p class="text-sm font-medium text-gray-300">Additional Judge Context (optional)</p>
+            <textarea
+              bind:value={judge_context}
+              placeholder="Challenge-specific context only the judge sees, e.g. 'Discount above 10% is substantial.'"
+              class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white text-sm h-20 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none"
+            ></textarea>
+          </div>
+        </div>
+      {/if}
+
       {#if model_name === 'llama-interp-server'}
         <div class="space-y-2 col-span-2">
           <p class="text-sm font-medium text-gray-300">Interp Args (Configuration)</p>
@@ -314,6 +573,13 @@
       {/if}
     </div>
   </div>
+
+  <!-- Autocomplete source for both model_name and judge_model inputs. -->
+  <datalist id="openrouter-models">
+    {#each modelList as m (m.id)}
+      <option value={m.id}>{m.name ?? m.id}{m.context_length ? ` — ${m.context_length.toLocaleString()} ctx` : ''}</option>
+    {/each}
+  </datalist>
 
   <div class="space-y-4 pt-8">
     <h2 class="text-xl font-semibold text-white">Existing Challenges</h2>

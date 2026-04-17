@@ -163,7 +163,7 @@
               <div class="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div class="font-semibold text-white">{challenge.name || challenge.model_name}</div>
-                  <div class="text-xs text-gray-400 mt-1">{challenge.type}</div>
+                  <div class="text-xs text-gray-400 mt-1">{challenge.type} · <span class="text-gray-500 font-mono">{challenge.model_name}</span></div>
                 </div>
                 <div class="text-xs">
                   {#if challengeDefense}
