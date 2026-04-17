@@ -647,7 +647,6 @@
 
   async function loadEscalationForTarget() {
     if (!selectedChallengeId || !userId) return;
-    if (attackMode !== 'pvp') return;
     const teamId = await getMyTeamId();
     if (!teamId) return;
 
@@ -657,12 +656,20 @@
     // gate below filters out results the user already dismissed via Attack
     // Again, so normal non-judge compromises stay visible on return visits
     // but cleared-by-user ones don't resurface.
+    // PvE keys on challenge_id (shared challenge, no per-team defense row).
     const isJudge = selectedTarget?.challenges?.type === 'judge';
+    const targetColumn: 'challenge_id' | 'defended_challenge_id' =
+      attackMode === 'pve' ? 'challenge_id' : 'defended_challenge_id';
     let query = supabase
       .from('attacks')
       .select('id, judge_verdict, judge_coefficient, judge_reason, escalation_status, escrow_amount, is_successful, log, created_at')
       .eq('attacker_team_id', teamId)
-      .eq('defended_challenge_id', selectedChallengeId);
+      .eq(targetColumn, selectedChallengeId);
+    if (attackMode === 'pve') {
+      // In PvE rows have challenge_id set but defended_challenge_id null. The
+      // extra filter excludes PvP rows where challenge_id happens to match.
+      query = query.is('defended_challenge_id', null);
+    }
     if (isJudge) {
       query = query.not('judge_verdict', 'is', null);
     } else {
@@ -725,7 +732,7 @@
       userId = userData?.user?.id ?? '';
 
       let myTeamId: string | null = null;
-      if (userId && resolveRoundType(roundInfo) === 'pvp') {
+      if (userId) {
         const { data: membership, error: membershipError } = await supabase
           .from('team_members')
           .select('team_id, teams!inner(game_id)')
@@ -735,7 +742,9 @@
           .maybeSingle();
         if (membershipError) { statusError = membershipError.message; return; }
         myTeamId = membership?.team_id ?? null;
+      }
 
+      if (resolveRoundType(roundInfo) === 'pvp') {
         const requiredDefenses = Math.max(0, Math.trunc(roundInfo?.required_defenses ?? 0));
         if (myTeamId && requiredDefenses > 0) {
           const { count: defendedCount, error: defendedCountError } = await supabase
@@ -754,9 +763,14 @@
 
       if (resolveRoundType(roundInfo) === 'pvp') {
         if (!myTeamId) { statusError = 'Could not determine your team for this game, so opponent targets cannot be resolved.'; return; }
+        // Explicit column list: `context` and `judge_rubric`/`judge_model`
+        // are admin secrets (the protected material and the grading criteria)
+        // and must never reach the attacker's browser. Server builds the real
+        // LLM system prompt from its own admin-query so omitting them here is
+        // safe.
         const { data, error } = await supabase
           .from('defended_challenges')
-          .select('id, team_id, is_active, teams!inner(name, game_id, coins), challenges(*)')
+          .select('id, team_id, is_active, teams!inner(name, game_id, coins), challenges(id, name, description, type, model_name, attack_steal_coins, defense_reward_coins, default_prompt, challenge_url, target_tool_name, created_at, challenge_tools(tools(*)))')
           .eq('teams.game_id', gameId)
           .in('challenge_id', allowedChallengeIds)
           .gt('teams.coins', 0)
@@ -803,15 +817,45 @@
             return Number(b.is_active) - Number(a.is_active);
           });
       } else {
+        // PvE: same principle — hide admin `context` and judge rubric from
+        // the attacker's client. In PvE the LLM is primed with the challenge's
+        // System Context on the server; attackers only need the descriptive
+        // metadata and reward numbers here.
         const { data, error } = await supabase
           .from('challenges')
-          .select('id, name, description, type, model_name, attack_steal_coins, default_prompt, *')
+          .select('id, name, description, type, model_name, attack_steal_coins, defense_reward_coins, default_prompt, challenge_url, target_tool_name, created_at')
           .in('id', allowedChallengeIds);
         if (error) { statusError = error.message; return; }
+
+        // Fetch the most recent judge verdict per PvE challenge for my team
+        // so the sidebar shows the outcome badge (matches the PvP flow).
+        const latestVerdictByChallenge = new Map<string, { attack_id: string; verdict: string; escalation_status: string | null }>();
+        if (myTeamId) {
+          const { data: myPveAttacks } = await supabase
+            .from('attacks')
+            .select('id, challenge_id, judge_verdict, escalation_status, created_at')
+            .eq('attacker_team_id', myTeamId)
+            .is('defended_challenge_id', null)
+            .in('challenge_id', allowedChallengeIds)
+            .not('judge_verdict', 'is', null)
+            .order('created_at', { ascending: false });
+          for (const row of myPveAttacks ?? []) {
+            const cid = row.challenge_id as string;
+            if (!latestVerdictByChallenge.has(cid)) {
+              latestVerdictByChallenge.set(cid, {
+                attack_id: row.id,
+                verdict: row.judge_verdict,
+                escalation_status: row.escalation_status ?? null
+              });
+            }
+          }
+        }
+
         challenges = (data ?? []).map((challenge: any) => ({
           id: challenge.id, team_id: null, is_active: true,
           teams: { name: roundInfo?.name ?? 'Default Defense', game_id: gameId, coins: 0 },
-          challenges: challenge
+          challenges: challenge,
+          latest_attempt: latestVerdictByChallenge.get(challenge.id) ?? null
         }));
       }
 

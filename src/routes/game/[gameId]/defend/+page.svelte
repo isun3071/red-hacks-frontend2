@@ -136,15 +136,21 @@
     {#if roundInfo}
       <p class="text-xs text-gray-500 mt-2">Round: {roundInfo.name} • {roundInfo.type.toUpperCase()}</p>
     {/if}
-    {#if roundInfo?.type === 'pve'}
-      <p class="text-xs text-amber-300 mt-2">This round uses the challenge default prompt as the defense. Team-specific setup is limited.</p>
-    {/if}
   </div>
 
   {#if loading}
     <div class="border border-white/10 bg-black/40 rounded-xl p-8 text-gray-300">Loading challenges...</div>
   {:else if statusError && !teamId}
     <div class="border border-red-500/40 bg-red-500/10 rounded-xl p-6 text-red-300">{statusError}</div>
+  {:else if roundInfo?.type === 'pve'}
+    <div class="border border-white/10 bg-slate-900/50 rounded-xl p-8 text-center space-y-2">
+      <div class="text-3xl">🛡️</div>
+      <div class="text-lg font-semibold text-white">Defense disabled this round</div>
+      <p class="text-sm text-gray-400 max-w-lg mx-auto">
+        This is a PvE round — every team attacks the challenge's default prompt. Per-team defenses aren't used and
+        aren't configurable right now. Defense returns in the next PvP round.
+      </p>
+    </div>
   {:else}
     <div class="border border-white/10 bg-slate-900/50 rounded-xl overflow-hidden">
       <div class="p-4 border-b border-white/10 bg-black/40">

@@ -48,8 +48,8 @@ describe('buildJudgeUserMessage', () => {
 		expect(text).toContain('</RUBRIC>')
 		expect(text).toContain('<DEFENDER_SYSTEM_PROMPT>')
 		expect(text).toContain('<TRANSCRIPT>')
-		expect(text).toContain('[user]')
-		expect(text).toContain('[assistant]')
+		expect(text).toContain('[ATTACKER]')
+		expect(text).toContain('[DEFENDER_LLM]')
 	})
 
 	it('only includes <CONTEXT> block when rubric has non-empty context', () => {
