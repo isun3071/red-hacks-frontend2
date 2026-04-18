@@ -36,6 +36,7 @@ type AttackRequestBody = {
   defended_challenge_id?: string;
   challenge_id?: string;
   game_id?: string;
+  round_type?: 'pvp' | 'pve';
   prompt?: string;
   guess?: string;
   messages?: Array<{ role?: string; content?: string }>;
@@ -608,7 +609,8 @@ export const POST: RequestHandler = async ({ params, request }) => {
     }
 
     const activeRoundChallengeIds = (activeRound.available_challenges ?? []).filter((roundChallengeId): roundChallengeId is string => typeof roundChallengeId === 'string' && roundChallengeId.length > 0);
-    const isPveTarget = activeRound.type === 'pve';
+    const requestedRoundType = body.round_type === 'pve' || body.round_type === 'pvp' ? body.round_type : null;
+    const isPveTarget = requestedRoundType ? requestedRoundType === 'pve' : activeRound.type === 'pve';
 
     let targetDetails: any = null;
     let targetSecretKey: string | null = null;
