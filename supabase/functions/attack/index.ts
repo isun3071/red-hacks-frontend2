@@ -29,83 +29,6 @@ function normalizeMessages(messages: unknown): ChatMessage[] {
     .filter((m) => ['system', 'user', 'assistant', 'tool'].includes(m.role) && m.content.length > 0)
 }
 
-const MAX_UPLOAD_MB = Math.max(1, Math.trunc(Number(Deno.env.get('MAX_UPLOAD_MB') || '10') || 10))
-const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-const ATTACHMENT_CONTEXT_CHAR_LIMIT = 12000
-
-type AttachmentInput = {
-  name?: string
-  type?: string
-  size?: number
-  content?: string
-}
-
-function normalizeAttachments(attachments: unknown): AttachmentInput[] {
-  if (!Array.isArray(attachments)) return []
-
-  let totalBytes = 0
-  const normalized: AttachmentInput[] = []
-
-  for (const attachment of attachments) {
-    if (!attachment || typeof attachment !== 'object') continue
-
-    const size = Number.isFinite(Number((attachment as any).size)) ? Math.max(0, Math.trunc(Number((attachment as any).size))) : 0
-    totalBytes += size
-    if (size > MAX_UPLOAD_BYTES || totalBytes > MAX_UPLOAD_BYTES) {
-      throw new Error(`Attached files exceed the ${MAX_UPLOAD_MB} MB limit.`)
-    }
-
-    normalized.push({
-      name: typeof (attachment as any).name === 'string' && (attachment as any).name.trim().length > 0 ? (attachment as any).name.trim() : 'attachment',
-      type: typeof (attachment as any).type === 'string' && (attachment as any).type.trim().length > 0 ? (attachment as any).type.trim() : 'application/octet-stream',
-      size,
-      content: typeof (attachment as any).content === 'string' ? (attachment as any).content.slice(0, ATTACHMENT_CONTEXT_CHAR_LIMIT) : ''
-    })
-  }
-
-  return normalized
-}
-
-function buildAttachmentContext(attachments: AttachmentInput[]): string {
-  if (attachments.length === 0) return ''
-
-  return attachments
-    .map((attachment) => {
-      const content = (attachment.content || '').trim()
-      const contentBlock = content ? `\n${content}` : ''
-      const truncatedSuffix = content.length >= ATTACHMENT_CONTEXT_CHAR_LIMIT ? '\n[Attachment content truncated]' : ''
-      return `[Attachment: ${attachment.name || 'attachment'} | ${attachment.type || 'application/octet-stream'} | ${attachment.size || 0} bytes]${contentBlock}${truncatedSuffix}`
-    })
-    .join('\n\n')
-}
-
-function mergeMessagesWithAttachments(messages: ChatMessage[], attachments: AttachmentInput[]) {
-  const normalizedMessages = messages.map((message) => ({ ...message }))
-  const attachmentContext = buildAttachmentContext(attachments)
-
-  if (!attachmentContext) {
-    return normalizedMessages
-  }
-
-  let lastUserIndex = -1
-  for (let index = normalizedMessages.length - 1; index >= 0; index -= 1) {
-    if (normalizedMessages[index].role === 'user') {
-      lastUserIndex = index
-      break
-    }
-  }
-
-  if (lastUserIndex >= 0) {
-    normalizedMessages[lastUserIndex] = {
-      ...normalizedMessages[lastUserIndex],
-      content: `${normalizedMessages[lastUserIndex].content}\n\n${attachmentContext}`.trim()
-    }
-    return normalizedMessages
-  }
-
-  return [...normalizedMessages, { role: 'user', content: attachmentContext }]
-}
-
 function extractToolCallNames(message: any): string[] {
   const toolCalls = message?.tool_calls
   if (!Array.isArray(toolCalls)) return []
@@ -113,6 +36,30 @@ function extractToolCallNames(message: any): string[] {
   return toolCalls
     .map((call) => call?.function?.name)
     .filter((name): name is string => typeof name === 'string' && name.length > 0)
+}
+
+function normalizeAssistantContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content
+  }
+
+  if (Array.isArray(content)) {
+    // Some providers return structured content parts instead of a single string.
+    const joined = content
+      .map((part) => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object' && typeof (part as any).text === 'string') {
+          return (part as any).text
+        }
+        return ''
+      })
+      .join('')
+      .trim()
+
+    return joined.length > 0 ? joined : 'No response received'
+  }
+
+  return 'No response received'
 }
 
 function extractSecretKey(...sources: unknown[]): string | null {
@@ -203,134 +150,15 @@ async function applyCoinSteal(
   return row
 }
 
-async function incrementTeamCoinsRpc(supabaseAdmin: any, teamId: string, delta: number): Promise<number | null> {
-  const { data, error } = await supabaseAdmin.rpc('increment_team_coins', {
-    p_team_id: teamId,
-    p_delta: delta
-  })
-
-  if (error) {
-    throw new Error(error.message || 'Failed to increment team coins')
-  }
-
-  if (typeof data === 'number') return data
-  if (Array.isArray(data) && typeof data[0] === 'number') return data[0]
-  return null
-}
-
-// NOTE: keep in sync with src/lib/bonus.ts. Deno edge functions cannot import
-// from the SvelteKit src/ tree. Unit-tested in src/lib/bonus.test.ts.
-const SOFT_TURN_CAP = 10
-const SOFT_CHAR_CAP = 4000
-
-type AttackBonusInput = {
-  turnCount: number
-  charCount: number
-  attackStealCoins: number
-  defenseRewardCoins: number
-}
-
-type AttackBonusResult = {
-  base: number
-  bonus: number
-  total: number
-  eleganceFactor: number
-  maxBonus: number
-}
-
-function sanitizeInteger(value: number, minimum: number): number {
-  if (typeof value !== 'number' || Number.isNaN(value)) return minimum
-  return Math.max(minimum, Math.trunc(value))
-}
-
-function calculateAttackBonus(input: AttackBonusInput): AttackBonusResult {
-  const base = sanitizeInteger(input.attackStealCoins, 0)
-  const defenseReward = sanitizeInteger(input.defenseRewardCoins, 0)
-  const maxBonus = Math.min(defenseReward, 3 * base)
-
-  const turns = sanitizeInteger(input.turnCount, 1)
-  const chars = sanitizeInteger(input.charCount, 0)
-
-  const turnFactor = Math.max(0, 1 - (turns - 1) / SOFT_TURN_CAP)
-  const charFactor = Math.max(0, 1 - chars / SOFT_CHAR_CAP)
-  const eleganceFactor = Math.min(turnFactor, charFactor)
-
-  const bonus = Math.floor(maxBonus * eleganceFactor)
-  const total = base + bonus
-
-  return { base, bonus, total, eleganceFactor, maxBonus }
-}
-
-type EleganceBonusArgs = {
-  supabaseAdmin: any
-  attackerTeamId: string
-  defendedChallengeId: string | null
-  pveChallengeId: string | null
-  defendedChallengeUpdatedAt: string | null
-  attackStealCoins: number
-  defenseRewardCoins: number
-  currentPromptChars: number
-}
-
-async function computeEleganceBonus(args: EleganceBonusArgs): Promise<AttackBonusResult & { turnCount: number; charCount: number }> {
-  const targetColumn = args.defendedChallengeId ? 'defended_challenge_id' : 'challenge_id'
-  const targetValue = args.defendedChallengeId ?? args.pveChallengeId ?? ''
-
-  const { data: lastSuccess } = await args.supabaseAdmin
-    .from('attacks')
-    .select('created_at')
-    .eq('attacker_team_id', args.attackerTeamId)
-    .eq(targetColumn, targetValue)
-    .eq('is_successful', true)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
-
-  const lastSuccessMs = lastSuccess?.created_at ? new Date(lastSuccess.created_at).getTime() : 0
-  const updatedAtMs = args.defendedChallengeUpdatedAt ? new Date(args.defendedChallengeUpdatedAt).getTime() : 0
-  const windowStartIso = new Date(Math.max(lastSuccessMs, updatedAtMs)).toISOString()
-
-  const { data: priorAttempts } = await args.supabaseAdmin
-    .from('attacks')
-    .select('is_successful, log')
-    .eq('attacker_team_id', args.attackerTeamId)
-    .eq(targetColumn, targetValue)
-    .gt('created_at', windowStartIso)
-    .eq('is_successful', false)
-
-  const priorTurns = priorAttempts?.length ?? 0
-  const priorChars = (priorAttempts ?? []).reduce((acc: number, row: any) => {
-    const logPrompt = row?.log?.latest_prompt
-    return acc + (typeof logPrompt === 'string' ? logPrompt.length : 0)
-  }, 0)
-
-  const turnCount = priorTurns + 1
-  const charCount = priorChars + Math.max(0, args.currentPromptChars)
-
-  const bonus = calculateAttackBonus({
-    turnCount,
-    charCount,
-    attackStealCoins: args.attackStealCoins,
-    defenseRewardCoins: args.defenseRewardCoins
-  })
-
-  return { ...bonus, turnCount, charCount }
-}
-
 Deno.serve(async (req) => {
   console.log('hit attack function endpoint')
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-    'Access-Control-Max-Age': '86400',
   }
   
   if (req.method === 'OPTIONS') {
-    return new Response(null, { 
-      status: 204,
-      headers: corsHeaders 
-    })
+    return new Response('ok', { headers: corsHeaders })
   }
 
   try {
@@ -369,8 +197,7 @@ Deno.serve(async (req) => {
       round_type,
       prompt,
       guess,
-      messages,
-      attachments
+      messages
     } = await req.json()
 
     if (!defended_challenge_id && !challenge_id) {
@@ -649,12 +476,8 @@ Deno.serve(async (req) => {
       }
     }
 
-    const normalizedAttachments = normalizeAttachments(attachments)
-    const mergedPrompt = [prompt, buildAttachmentContext(normalizedAttachments)]
-      .filter((part) => typeof part === 'string' && part.trim().length > 0)
-      .join('\n\n')
-    const challengeMessages = mergeMessagesWithAttachments(normalizeMessages(messages), normalizedAttachments)
-    const userMessageFromPrompt: ChatMessage[] = mergedPrompt ? [{ role: 'user', content: mergedPrompt }] : []
+    const challengeMessages = normalizeMessages(messages)
+    const userMessageFromPrompt: ChatMessage[] = prompt ? [{ role: 'user', content: prompt }] : []
 
     const finalUserMessages = challengeMessages.length > 0 ? challengeMessages : userMessageFromPrompt
     const latestPrompt = finalUserMessages.length > 0
@@ -700,49 +523,14 @@ Deno.serve(async (req) => {
           }
         }
 
-        const currentPromptChars = (guess ?? '').length + (latestPrompt ?? '').length
-        const challengeStealCoins = Math.max(0, Math.trunc(challenges.attack_steal_coins ?? 0))
-        const challengeDefenseReward = Math.max(0, Math.trunc(challenges.defense_reward_coins ?? 0))
-
-        const bonusResult = await computeEleganceBonus({
-          supabaseAdmin,
-          attackerTeamId,
-          defendedChallengeId: isPveTarget ? null : (targetDetails?.id ?? defended_challenge_id ?? null),
-          pveChallengeId: isPveTarget ? (challenge_id ?? null) : null,
-          defendedChallengeUpdatedAt: isPveTarget ? null : (targetDetails?.updated_at ?? null),
-          attackStealCoins: challengeStealCoins,
-          defenseRewardCoins: challengeDefenseReward,
-          currentPromptChars
-        })
-
-        let attackerCoinsAfter = transferResult?.attacker_coins ?? null
-        if (bonusResult.bonus > 0 && attackerTeamId) {
-          const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusResult.bonus)
-          if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
-        }
-        // PvE secret-key: no transfer happened, so the base coins also need to be minted here.
-        if (isPveTarget && bonusResult.base > 0 && attackerTeamId) {
-          const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusResult.base)
-          if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
-        }
-
-        const baseCoins = isPveTarget ? bonusResult.base : (transferResult?.stolen_coins ?? 0)
-        const totalStolen = baseCoins + bonusResult.bonus
-
         const attackLog = {
           ...attackLogBase,
           victory_condition: 'secret-key',
           outcome: 'success',
           assistant_message: 'System breached. Key accepted.',
-          stolen_coins: totalStolen,
-          base_coins: baseCoins,
-          bonus_coins: bonusResult.bonus,
-          elegance_factor: bonusResult.eleganceFactor,
-          max_bonus: bonusResult.maxBonus,
-          turn_count: bonusResult.turnCount,
-          char_count: bonusResult.charCount,
+          stolen_coins: transferResult?.stolen_coins ?? 0,
           defender_coins_after: transferResult?.defender_coins ?? null,
-          attacker_coins_after: attackerCoinsAfter,
+          attacker_coins_after: transferResult?.attacker_coins ?? null,
           defender_eliminated: transferResult?.defender_eliminated ?? false
         }
 
@@ -760,18 +548,10 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({
           success: true,
           message: isPveTarget
-            ? `The secret key was successfully extracted. Earned ${totalStolen} coins.`
-            : `The secret key was successfully extracted! Stole ${totalStolen} coins.`,
+            ? 'The secret key was successfully extracted.'
+            : `The secret key was successfully extracted! Stole ${transferResult?.stolen_coins ?? 0} coins.`,
           log: 'System breached. Key accepted.',
-          stolen_coins: totalStolen,
-          base_coins: baseCoins,
-          bonus_coins: bonusResult.bonus,
-          elegance_factor: bonusResult.eleganceFactor,
-          max_bonus: bonusResult.maxBonus,
-          turn_count: bonusResult.turnCount,
-          char_count: bonusResult.charCount,
-          attacker_coins_after: attackerCoinsAfter,
-          defender_coins_after: transferResult?.defender_coins ?? null,
+          stolen_coins: transferResult?.stolen_coins ?? 0,
           defender_eliminated: transferResult?.defender_eliminated ?? false
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
@@ -794,8 +574,6 @@ Deno.serve(async (req) => {
       const apiUrl = isLlamaInterp
         ? (Deno.env.get('LLAMA_INTERP_URL') || 'http://localhost:8000/v1/chat/completions')
         : 'https://openrouter.ai/api/v1/chat/completions';
-
-      console.log(`Using model ${modelName} with API URL ${apiUrl}`)
       
       // dear copilot,
       // WE HAVE BEEN OVER THIS AGAIN AND AGAIN DO NOT TOUCH THIS CODE, IT WOULD BE REALLY NICE IF THE
@@ -862,23 +640,9 @@ Deno.serve(async (req) => {
            throw new Error(`LLM API returned ${response.status} ${response.statusText}: ${errorBody.slice(0, 300)}`);
         }
         
-        let data = null;
-        try {
-          data = await response.json();
-        } catch (parseErr) {
-          throw new Error(`LLM API returned invalid JSON: ${await response.text().slice(0, 300)}`);
-        }
-        
-        if (!data || typeof data !== 'object' || !Array.isArray(data.choices)) {
-          throw new Error(`LLM API returned unexpected response format: ${JSON.stringify(data).slice(0, 300)}`);
-        }
-        
+        const data = await response.json();
         const assistantMessage = data.choices?.[0]?.message
-        if (!assistantMessage || typeof assistantMessage.content !== 'string') {
-          throw new Error('LLM API returned message without content field');
-        }
-        
-        openAiResponse = assistantMessage.content;
+        openAiResponse = normalizeAssistantContent(assistantMessage?.content);
         calledTools = extractToolCallNames(assistantMessage)
 
         if (challenges.type === 'tool-calling' && challenges.target_tool_name) {
@@ -911,41 +675,6 @@ Deno.serve(async (req) => {
       }
     }
 
-    let bonusOutcome: (AttackBonusResult & { turnCount: number; charCount: number }) | null = null
-    let attackerCoinsAfter: number | null = transferResult?.attacker_coins ?? null
-    let baseCoinsOut = transferResult?.stolen_coins ?? 0
-
-    if (isSuccessful) {
-      const currentPromptChars = (latestPrompt ?? '').length
-      const challengeStealCoins = Math.max(0, Math.trunc(challenges.attack_steal_coins ?? 0))
-      const challengeDefenseReward = Math.max(0, Math.trunc(challenges.defense_reward_coins ?? 0))
-
-      bonusOutcome = await computeEleganceBonus({
-        supabaseAdmin,
-        attackerTeamId,
-        defendedChallengeId: isPveTarget ? null : (targetDetails?.id ?? defended_challenge_id ?? null),
-        pveChallengeId: isPveTarget ? (challenge_id ?? null) : null,
-        defendedChallengeUpdatedAt: isPveTarget ? null : (targetDetails?.updated_at ?? null),
-        attackStealCoins: challengeStealCoins,
-        defenseRewardCoins: challengeDefenseReward,
-        currentPromptChars
-      })
-
-      // PvE general path: no transfer happened, mint the base reward.
-      if (isPveTarget && bonusOutcome.base > 0 && attackerTeamId) {
-        const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusOutcome.base)
-        if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
-        baseCoinsOut = bonusOutcome.base
-      }
-
-      if (bonusOutcome.bonus > 0 && attackerTeamId) {
-        const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusOutcome.bonus)
-        if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
-      }
-    }
-
-    const totalStolen = baseCoinsOut + (bonusOutcome?.bonus ?? 0)
-
     const attackLog = {
       ...attackLogBase,
       latest_prompt: latestPrompt,
@@ -953,15 +682,9 @@ Deno.serve(async (req) => {
       called_tools: calledTools,
       target_tool_name: challenges.target_tool_name,
       outcome: isSuccessful ? 'success' : 'failed',
-      stolen_coins: totalStolen,
-      base_coins: baseCoinsOut,
-      bonus_coins: bonusOutcome?.bonus ?? 0,
-      elegance_factor: bonusOutcome?.eleganceFactor ?? null,
-      max_bonus: bonusOutcome?.maxBonus ?? null,
-      turn_count: bonusOutcome?.turnCount ?? null,
-      char_count: bonusOutcome?.charCount ?? null,
+      stolen_coins: transferResult?.stolen_coins ?? 0,
       defender_coins_after: transferResult?.defender_coins ?? null,
-      attacker_coins_after: attackerCoinsAfter,
+      attacker_coins_after: transferResult?.attacker_coins ?? null,
       defender_eliminated: transferResult?.defender_eliminated ?? false
     }
 
@@ -976,25 +699,17 @@ Deno.serve(async (req) => {
 
     await uploadAttackTranscript(supabaseAdmin, defended_challenge_id, attackLog)
 
-    return new Response(JSON.stringify({
+    return new Response(JSON.stringify({ 
       success: isSuccessful,
       message: isSuccessful
         ? isPveTarget
-          ? `Victory condition met. Earned ${totalStolen} coins.`
-          : `Victory condition met. Stole ${totalStolen} coins.`
+          ? 'Victory condition met.'
+          : `Victory condition met. Stole ${transferResult?.stolen_coins ?? 0} coins.`
         : 'Prompt evaluated by the model. Read output below.',
       log: `Model Output: ${openAiResponse}`,
       assistant: openAiResponse,
       tool_calls: calledTools,
-      stolen_coins: totalStolen,
-      base_coins: baseCoinsOut,
-      bonus_coins: bonusOutcome?.bonus ?? 0,
-      elegance_factor: bonusOutcome?.eleganceFactor ?? null,
-      max_bonus: bonusOutcome?.maxBonus ?? null,
-      turn_count: bonusOutcome?.turnCount ?? null,
-      char_count: bonusOutcome?.charCount ?? null,
-      attacker_coins_after: attackerCoinsAfter,
-      defender_coins_after: transferResult?.defender_coins ?? null,
+      stolen_coins: transferResult?.stolen_coins ?? 0,
       defender_eliminated: transferResult?.defender_eliminated ?? false,
       challenge_id: isPveTarget ? challenge_id : null
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
